@@ -1,65 +1,47 @@
-import Image from "next/image";
+import Link from "next/link";
 
 export default function Home() {
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <main className="mx-auto max-w-2xl px-4 py-16">
+      <h1 className="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
+        泰文 Anki 单词卡辅助
+      </h1>
+      <p className="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+        在本地官网与公众号文章目录中检索例句（去空格匹配）。有音频的公众号编号会显示
+        🎵，否则为 📺；若例句中含中文则标注中文对照。
+      </p>
+      <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-500">
+        路径与编号映射见项目根目录{" "}
+        <code className="rounded bg-zinc-200 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800">
+          article-config.json
+        </code>
+        ，可按需修改。
+      </p>
+      <ul className="mt-10 flex flex-col gap-3 sm:flex-row sm:gap-4">
+        <li className="flex-1">
+          <Link
+            href="/search"
+            className="block rounded-xl border border-zinc-200 bg-white p-5 shadow-sm transition hover:border-zinc-300 hover:shadow dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            <span className="font-medium text-zinc-900 dark:text-zinc-50">单词搜索</span>
+            <span className="mt-1 block text-sm text-zinc-500">单条词语，查看例句与来源</span>
+          </Link>
+        </li>
+        <li className="flex-1">
+          <Link
+            href="/batch"
+            className="block rounded-xl border border-zinc-200 bg-white p-5 shadow-sm transition hover:border-zinc-300 hover:shadow dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700"
           >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+            <span className="font-medium text-zinc-900 dark:text-zinc-50">批量搜索</span>
+            <span className="mt-1 block text-sm text-zinc-500">多词状态汇总并导出 txt</span>
+          </Link>
+        </li>
+      </ul>
+      <p className="mt-12 text-xs text-zinc-400 dark:text-zinc-600">
+        运行前请安装 Python 3，并执行{" "}
+        <code className="rounded bg-zinc-200 px-1 font-mono dark:bg-zinc-800">npm run dev</code>{" "}
+        启动 Next.js。
+      </p>
+    </main>
   );
 }
