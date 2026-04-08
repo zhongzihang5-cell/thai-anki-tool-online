@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   buildAnkiImportCsv,
@@ -8,18 +9,23 @@ import {
   emptyDraft,
   type Next30DraftRow,
 } from "@/lib/ankiCsvExport";
-import { pickNext30, thaiWordKey } from "@/lib/pickNext30";
+import { pickNextBatch, thaiWordKey } from "@/lib/pickNext30";
 import type { WordRow, WordsCatalogStats } from "@/lib/runWordsCatalog";
+import {
+  isShelvedKey,
+  loadShelvedKeys,
+  saveShelvedKeys,
+} from "@/lib/shelvedThai";
 import { TAB_PERSIST, useStickyTabState } from "@/lib/useStickyTabState";
 
-const LS_EXCEL = "thai-anki-words-excel";
-const LS_ANKI = "thai-anki-words-anki";
-
-const DEFAULT_EXCEL = "/Users/zhongzihang/Desktop/泰语高频词0226.xlsx";
-const DEFAULT_ANKI =
-  "/Users/zhongzihang/Library/Application Support/Anki2/账户 1/collection.anki2";
-
-type FilterKey = "all" | "pending" | "supplement" | "deletable" | "done" | "judged";
+type FilterKey =
+  | "all"
+  | "pending"
+  | "supplement"
+  | "deletable"
+  | "done"
+  | "judged"
+  | "shelved";
 
 type WordsPersist = {
   filter: FilterKey;
@@ -59,12 +65,8 @@ function statusBadgeClass(s: WordRow["status"]): string {
 }
 
 export default function WordsPage() {
-  const [excelPath, setExcelPath] = useState(DEFAULT_EXCEL);
-  const [ankiPath, setAnkiPath] = useState(DEFAULT_ANKI);
-
   const [snap, setSnap] = useStickyTabState<WordsPersist>(TAB_PERSIST.words, WORDS_INITIAL);
   const { filter, stats, next30Visible, error } = snap;
-  /** localStorage 旧数据可能缺字段或非数组，避免 words.length 抛错导致整页无响应 */
   const words = Array.isArray(snap.words) ? snap.words : [];
   const next30 = Array.isArray(snap.next30) ? snap.next30 : [];
   const next30Drafts =
@@ -72,30 +74,26 @@ export default function WordsPage() {
       ? snap.next30Drafts
       : next30.map(() => emptyDraft());
   const [loading, setLoading] = useState(false);
-
-  const filtered = useMemo(() => {
-    if (filter === "all") return words;
-    return words.filter((w) => w.status === filter);
-  }, [words, filter]);
+  const [shelved, setShelved] = useState<Set<string>>(new Set());
+  const [batchSize, setBatchSize] = useState(30);
 
   useEffect(() => {
-    try {
-      const e = localStorage.getItem(LS_EXCEL);
-      const a = localStorage.getItem(LS_ANKI);
-      if (e) setExcelPath(e);
-      if (a) setAnkiPath(a);
-    } catch {
-      /* ignore */
-    }
+    setShelved(loadShelvedKeys());
   }, []);
 
-  async function fetchWords() {
-    try {
-      localStorage.setItem(LS_EXCEL, excelPath);
-      localStorage.setItem(LS_ANKI, ankiPath);
-    } catch {
-      /* ignore */
+  useEffect(() => {
+    saveShelvedKeys(shelved);
+  }, [shelved]);
+
+  const filtered = useMemo(() => {
+    if (filter === "shelved") {
+      return words.filter((w) => isShelvedKey(shelved, w.thai));
     }
+    if (filter === "all") return words;
+    return words.filter((w) => w.status === filter);
+  }, [words, filter, shelved]);
+
+  const fetchWords = useCallback(async () => {
     setLoading(true);
     setSnap((s) => ({
       ...s,
@@ -108,7 +106,7 @@ export default function WordsPage() {
       const res = await fetch("/api/words", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ excelPath, ankiDbPath: ankiPath }),
+        body: JSON.stringify({}),
       });
       const data = (await res.json()) as {
         stats?: WordsCatalogStats;
@@ -124,13 +122,13 @@ export default function WordsPage() {
         }));
         return;
       }
-      const s = data.stats;
+      const st = data.stats;
       setSnap((prev) => ({
         ...prev,
-        stats: s
+        stats: st
           ? {
-              ...s,
-              judged: s.judged ?? 0,
+              ...st,
+              judged: st.judged ?? 0,
             }
           : null,
         words: data.words ?? [],
@@ -145,26 +143,40 @@ export default function WordsPage() {
     } finally {
       setLoading(false);
     }
+  }, [setSnap]);
+
+  useEffect(() => {
+    void fetchWords();
+  }, [fetchWords]);
+
+  function toggleShelve(thai: string) {
+    const k = thaiWordKey(thai);
+    setShelved((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
   }
 
-  function handleNext30() {
+  function handleNextBatch() {
     setSnap((s) => {
       const list = Array.isArray(s.words) ? s.words : [];
       if (list.length === 0) {
         return {
           ...s,
-          error: "请先到上方点击「加载数据」，确认 /api/words 返回词表后再获取待处理词。",
+          error: "词表为空，请确认数据源设置（设置页）后刷新。",
         };
       }
       const prev = Array.isArray(s.next30) ? s.next30 : [];
       const exclude = new Set(prev.map((w) => thaiWordKey(w.thai)));
-      const picked = pickNext30(list, exclude);
+      const picked = pickNextBatch(list, batchSize, exclude, shelved);
       if (picked.length === 0) {
         return {
           ...s,
           error:
-            exclude.size > 0
-              ? "当前列表里的待处理词已全部展示过，没有更多未展示的待录入/需补充词。可先处理完或点击「加载数据」刷新词表。"
+            exclude.size > 0 || shelved.size > 0
+              ? "没有更多未展示的待录入/需补充词（可能已全部展示、已搁置或已完成队列）。可切换筛选或恢复搁置。"
               : "词表中没有状态为「待录入」或「需补充例句」的词。",
         };
       }
@@ -216,49 +228,32 @@ export default function WordsPage() {
     { key: "deletable", label: "可删除" },
     { key: "done", label: "已完成" },
     { key: "judged", label: "已判断" },
+    { key: "shelved", label: `搁置 (${shelved.size})` },
   ];
+
+  const inp =
+    "w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900";
+  const lab = "mb-0.5 block text-[11px] font-medium text-zinc-500";
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-10">
       <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50">单词管理</h1>
       <p className="mt-1 text-sm text-zinc-500">
-        Excel 词表与 Anki 牌组对照。路径可修改，会保存在本机浏览器。
-        <span className="text-zinc-400"> 切换顶部导航会保留上次加载的数据与下 30 个草稿。</span>
+        打开本页会自动从{" "}
+        <Link href="/settings" className="text-teal-700 underline dark:text-teal-400">
+          数据源设置
+        </Link>{" "}
+        中的路径读取最新 Anki 与 Excel。搁置的词不会进入「待处理」队列；在「搁置」筛选中可查看并恢复。
       </p>
 
-      <div className="mt-6 grid gap-3 sm:grid-cols-2">
-        <label className="block sm:col-span-2">
-          <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-            Excel 文件路径
-          </span>
-          <input
-            value={excelPath}
-            onChange={(e) => setExcelPath(e.target.value)}
-            className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs outline-none ring-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900"
-            spellCheck={false}
-          />
-        </label>
-        <label className="block sm:col-span-2">
-          <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-            Anki collection.anki2 路径
-          </span>
-          <input
-            value={ankiPath}
-            onChange={(e) => setAnkiPath(e.target.value)}
-            className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs outline-none ring-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900"
-            spellCheck={false}
-          />
-        </label>
-      </div>
-
-      <div className="mt-3 flex flex-wrap gap-3">
+      <div className="mt-4 flex flex-wrap gap-3">
         <button
           type="button"
-          onClick={fetchWords}
+          onClick={() => void fetchWords()}
           disabled={loading}
           className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition enabled:hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:enabled:hover:bg-zinc-200"
         >
-          {loading ? "加载中…" : "加载数据"}
+          {loading ? "刷新中…" : "立即刷新"}
         </button>
       </div>
 
@@ -296,18 +291,29 @@ export default function WordsPage() {
           </div>
 
           <div className="mt-4 flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              本批数量
+              <input
+                type="number"
+                min={1}
+                max={200}
+                value={batchSize}
+                onChange={(e) => setBatchSize(Number(e.target.value) || 30)}
+                className="w-16 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+              />
+            </label>
             <button
               type="button"
-              onClick={handleNext30}
+              onClick={handleNextBatch}
               disabled={loading}
               title={
                 words.length === 0
-                  ? "请先点击「加载数据」"
+                  ? "等待词表加载"
                   : "再次点击会跳过当前列表中已展示的词，取下一批"
               }
               className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition enabled:hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:enabled:hover:bg-zinc-800"
             >
-              获取下30个待处理
+              获取下 N 个待处理
             </button>
             {next30Visible && next30.length > 0 && (
               <>
@@ -325,6 +331,12 @@ export default function WordsPage() {
                 >
                   生成导入CSV
                 </button>
+                <Link
+                  href="/workflow"
+                  className="rounded-lg border border-teal-600 px-4 py-2 text-sm font-medium text-teal-800 dark:border-teal-500 dark:text-teal-300"
+                >
+                  去工作流录入
+                </Link>
               </>
             )}
           </div>
@@ -333,12 +345,12 @@ export default function WordsPage() {
             <div className="mt-4 space-y-4">
               <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
                 <p className="text-xs font-medium text-zinc-500">
-                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。再次点击「获取下30个待处理」会跳过本页当前列表里已展示的词，取下一批。共 {next30.length}{" "}
-                  个。填写例句后点「生成导入CSV」：20 列，音频列为{" "}
-                  <code className="rounded bg-zinc-100 px-1 font-mono text-[10px] dark:bg-zinc-800">
-                    [sound:对应文字.wav]
-                  </code>
-                  。
+                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。已搁置的词不会入选。再次点击会跳过本页当前列表里已展示的词。共 {next30.length}{" "}
+                  个。也可在{" "}
+                  <Link href="/workflow" className="text-teal-700 underline dark:text-teal-400">
+                    工作流
+                  </Link>{" "}
+                  中录入并导出。
                 </p>
                 <p className="mt-2 font-mono text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
                   {next30.map((w) => w.thai).join("、")}
@@ -347,9 +359,6 @@ export default function WordsPage() {
 
               {next30.map((w, idx) => {
                 const d = next30Drafts[idx] ?? emptyDraft();
-                const inp =
-                  "w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900";
-                const lab = "mb-0.5 block text-[11px] font-medium text-zinc-500";
                 return (
                   <div
                     key={`${w.thai}-${idx}`}
@@ -385,7 +394,9 @@ export default function WordsPage() {
                               <input
                                 className={inp}
                                 value={String(d[thaiK])}
-                                onChange={(e) => patchDraft(idx, { [thaiK]: e.target.value } as Partial<Next30DraftRow>)}
+                                onChange={(e) =>
+                                  patchDraft(idx, { [thaiK]: e.target.value } as Partial<Next30DraftRow>)
+                                }
                               />
                             </label>
                             <label className="mt-2 block">
@@ -393,7 +404,9 @@ export default function WordsPage() {
                               <input
                                 className={inp}
                                 value={String(d[ipaK])}
-                                onChange={(e) => patchDraft(idx, { [ipaK]: e.target.value } as Partial<Next30DraftRow>)}
+                                onChange={(e) =>
+                                  patchDraft(idx, { [ipaK]: e.target.value } as Partial<Next30DraftRow>)
+                                }
                               />
                             </label>
                             <label className="mt-2 block">
@@ -401,7 +414,9 @@ export default function WordsPage() {
                               <input
                                 className={inp}
                                 value={String(d[zhK])}
-                                onChange={(e) => patchDraft(idx, { [zhK]: e.target.value } as Partial<Next30DraftRow>)}
+                                onChange={(e) =>
+                                  patchDraft(idx, { [zhK]: e.target.value } as Partial<Next30DraftRow>)
+                                }
                               />
                             </label>
                           </fieldset>
@@ -432,7 +447,7 @@ export default function WordsPage() {
           </div>
 
           <div className="mt-4 overflow-x-auto rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-            <table className="w-full min-w-[880px] text-left text-sm">
+            <table className="w-full min-w-[960px] text-left text-sm">
               <thead>
                 <tr className="border-b border-zinc-200 bg-zinc-50 text-xs font-medium uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:bg-zinc-800/50">
                   <th className="px-3 py-2">泰文</th>
@@ -442,35 +457,58 @@ export default function WordsPage() {
                   <th className="px-3 py-2">状态</th>
                   <th className="px-3 py-2">需例句</th>
                   <th className="px-3 py-2">Anki例句数</th>
+                  <th className="px-3 py-2">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((w, i) => (
-                  <tr
-                    key={`${w.thai}-${i}`}
-                    className="border-b border-zinc-100 last:border-0 dark:border-zinc-800"
-                  >
-                    <td className="px-3 py-2 font-mono font-medium text-zinc-900 dark:text-zinc-50">
-                      {w.thai}
-                    </td>
-                    <td className="max-w-[140px] truncate px-3 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                      {w.ipa || "—"}
-                    </td>
-                    <td className="max-w-[200px] px-3 py-2 text-zinc-700 dark:text-zinc-300">{w.chinese || "—"}</td>
-                    <td className="px-3 py-2 tabular-nums text-zinc-600 dark:text-zinc-400">{w.frequency}</td>
-                    <td className="px-3 py-2">
-                      <span
-                        className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${statusBadgeClass(w.status)}`}
-                      >
-                        {w.status === "done" ? "已完成" : w.statusLabel}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 tabular-nums text-zinc-600">{w.requiredLabel}</td>
-                    <td className="px-3 py-2 tabular-nums text-zinc-600">
-                      {w.ankiNoteCount ?? w.ankiExampleCount ?? 0}
-                    </td>
-                  </tr>
-                ))}
+                {filtered.map((w, i) => {
+                  const shelvedHere = isShelvedKey(shelved, w.thai);
+                  return (
+                    <tr
+                      key={`${w.thai}-${i}`}
+                      className="border-b border-zinc-100 last:border-0 dark:border-zinc-800"
+                    >
+                      <td className="px-3 py-2 font-mono font-medium text-zinc-900 dark:text-zinc-50">
+                        {w.thai}
+                      </td>
+                      <td className="max-w-[140px] truncate px-3 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-400">
+                        {w.ipa || "—"}
+                      </td>
+                      <td className="max-w-[200px] px-3 py-2 text-zinc-700 dark:text-zinc-300">{w.chinese || "—"}</td>
+                      <td className="px-3 py-2 tabular-nums text-zinc-600 dark:text-zinc-400">{w.frequency}</td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${statusBadgeClass(w.status)}`}
+                        >
+                          {w.status === "done" ? "已完成" : w.statusLabel}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 tabular-nums text-zinc-600">{w.requiredLabel}</td>
+                      <td className="px-3 py-2 tabular-nums text-zinc-600">
+                        {w.ankiNoteCount ?? w.ankiExampleCount ?? 0}
+                      </td>
+                      <td className="px-3 py-2">
+                        {filter === "shelved" ? (
+                          <button
+                            type="button"
+                            onClick={() => toggleShelve(w.thai)}
+                            className="text-xs font-medium text-teal-700 underline dark:text-teal-400"
+                          >
+                            恢复
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => toggleShelve(w.thai)}
+                            className="text-xs font-medium text-amber-800 underline dark:text-amber-300"
+                          >
+                            {shelvedHere ? "已搁置 · 点恢复" : "搁置"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

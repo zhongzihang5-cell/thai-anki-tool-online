@@ -27,7 +27,7 @@ export function emptyDraft(): Next30DraftRow {
 }
 
 function soundTag(text: string): string {
-  const t = text.trim();
+  const t = text.trim().replace(/\//g, "、");
   if (!t) return "";
   return `[sound:${t}.wav]`;
 }

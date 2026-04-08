@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { runWordsCatalog } from "@/lib/runWordsCatalog";
+import { readWordsConfigFile } from "@/lib/serverWordsConfig";
 
 export async function POST(req: Request) {
   let body: unknown = {};
@@ -9,10 +10,25 @@ export async function POST(req: Request) {
     body = {};
   }
   const b = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+  let fileDefaults: Awaited<ReturnType<typeof readWordsConfigFile>> | null = null;
+  try {
+    fileDefaults = await readWordsConfigFile();
+  } catch {
+    fileDefaults = null;
+  }
   const payload = {
-    excelPath: typeof b.excelPath === "string" ? b.excelPath : undefined,
-    ankiDbPath: typeof b.ankiDbPath === "string" ? b.ankiDbPath : undefined,
-    sheetName: typeof b.sheetName === "string" ? b.sheetName : undefined,
+    excelPath:
+      typeof b.excelPath === "string"
+        ? b.excelPath
+        : (fileDefaults?.excelPath ?? undefined),
+    ankiDbPath:
+      typeof b.ankiDbPath === "string"
+        ? b.ankiDbPath
+        : (fileDefaults?.ankiDbPath ?? undefined),
+    sheetName:
+      typeof b.sheetName === "string"
+        ? b.sheetName
+        : (fileDefaults?.sheetName ?? undefined),
   };
   try {
     const data = await runWordsCatalog(payload);
