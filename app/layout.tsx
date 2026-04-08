@@ -43,6 +43,9 @@ function Nav() {
           <Link href="/words" className={link}>
             单词管理
           </Link>
+          <Link href="/workspace" className={link}>
+            工作台
+          </Link>
         </nav>
       </div>
     </header>

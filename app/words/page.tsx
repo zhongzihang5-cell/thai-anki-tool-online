@@ -2,12 +2,19 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import {
+  buildAnkiImportCsv,
+  downloadTextFile,
+  emptyDraft,
+  type Next30DraftRow,
+} from "@/lib/ankiCsvExport";
+import { pickNext30 } from "@/lib/pickNext30";
 import type { WordRow, WordsCatalogStats } from "@/lib/runWordsCatalog";
 
 const LS_EXCEL = "thai-anki-words-excel";
 const LS_ANKI = "thai-anki-words-anki";
 
-const DEFAULT_EXCEL = "/Users/zhongzihang/Downloads/泰语高频词0226.xlsx";
+const DEFAULT_EXCEL = "/Users/zhongzihang/Desktop/泰语高频词0226.xlsx";
 const DEFAULT_ANKI =
   "/Users/zhongzihang/Library/Application Support/Anki2/账户 1/collection.anki2";
 
@@ -30,16 +37,6 @@ function statusBadgeClass(s: WordRow["status"]): string {
   }
 }
 
-function pickNext30(words: WordRow[]): WordRow[] {
-  const pen = words
-    .filter((w) => w.status === "pending")
-    .sort((a, b) => b.frequency - a.frequency);
-  const sup = words
-    .filter((w) => w.status === "supplement")
-    .sort((a, b) => b.frequency - a.frequency);
-  return [...pen, ...sup].slice(0, 30);
-}
-
 export default function WordsPage() {
   const [excelPath, setExcelPath] = useState(DEFAULT_EXCEL);
   const [ankiPath, setAnkiPath] = useState(DEFAULT_ANKI);
@@ -50,6 +47,7 @@ export default function WordsPage() {
   const [words, setWords] = useState<WordRow[]>([]);
   const [filter, setFilter] = useState<FilterKey>("all");
   const [next30, setNext30] = useState<WordRow[]>([]);
+  const [next30Drafts, setNext30Drafts] = useState<Next30DraftRow[]>([]);
   const [next30Visible, setNext30Visible] = useState(false);
 
   const filtered = useMemo(() => {
@@ -79,6 +77,7 @@ export default function WordsPage() {
     setError(null);
     setNext30Visible(false);
     setNext30([]);
+    setNext30Drafts([]);
     try {
       const res = await fetch("/api/words", {
         method: "POST",
@@ -118,7 +117,21 @@ export default function WordsPage() {
   function handleNext30() {
     const picked = pickNext30(words);
     setNext30(picked);
+    setNext30Drafts(picked.map(() => emptyDraft()));
     setNext30Visible(true);
+  }
+
+  function patchDraft(index: number, patch: Partial<Next30DraftRow>) {
+    setNext30Drafts((prev) =>
+      prev.map((row, i) => (i === index ? { ...row, ...patch } : row))
+    );
+  }
+
+  function handleGenerateCsv() {
+    if (next30.length === 0) return;
+    const csv = buildAnkiImportCsv(next30, next30Drafts);
+    const name = `anki-import-${new Date().toISOString().slice(0, 10)}.csv`;
+    downloadTextFile(name, csv, "text/csv;charset=utf-8");
   }
 
   async function copyNext30Thai() {
@@ -225,24 +238,107 @@ export default function WordsPage() {
               获取下30个待处理
             </button>
             {next30Visible && next30.length > 0 && (
-              <button
-                type="button"
-                onClick={copyNext30Thai}
-                className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-500"
-              >
-                一键复制词语（{next30.length}）
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={copyNext30Thai}
+                  className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-500"
+                >
+                  一键复制词语（{next30.length}）
+                </button>
+                <button
+                  type="button"
+                  onClick={handleGenerateCsv}
+                  className="rounded-lg bg-violet-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-violet-800 dark:bg-violet-600 dark:hover:bg-violet-500"
+                >
+                  生成导入CSV
+                </button>
+              </>
             )}
           </div>
 
-          {next30Visible && (
-            <div className="mt-4 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-              <p className="text-xs font-medium text-zinc-500">
-                优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。共 {next30.length} 个。
-              </p>
-              <p className="mt-2 font-mono text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
-                {next30.map((w) => w.thai).join("、")}
-              </p>
+          {next30Visible && next30.length > 0 && (
+            <div className="mt-4 space-y-4">
+              <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+                <p className="text-xs font-medium text-zinc-500">
+                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。共 {next30.length}{" "}
+                  个。填写例句后点「生成导入CSV」：20 列，音频列为{" "}
+                  <code className="rounded bg-zinc-100 px-1 font-mono text-[10px] dark:bg-zinc-800">
+                    [sound:对应文字.wav]
+                  </code>
+                  。
+                </p>
+                <p className="mt-2 font-mono text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                  {next30.map((w) => w.thai).join("、")}
+                </p>
+              </div>
+
+              {next30.map((w, idx) => {
+                const d = next30Drafts[idx] ?? emptyDraft();
+                const inp =
+                  "w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900";
+                const lab = "mb-0.5 block text-[11px] font-medium text-zinc-500";
+                return (
+                  <div
+                    key={`${w.thai}-${idx}`}
+                    className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
+                  >
+                    <div className="flex flex-wrap items-baseline gap-2 border-b border-zinc-100 pb-3 dark:border-zinc-800">
+                      <span className="text-xs font-medium text-zinc-400">#{idx + 1}</span>
+                      <span className="font-mono text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                        {w.thai}
+                      </span>
+                      <span className="font-mono text-sm text-zinc-600 dark:text-zinc-400">{w.ipa || "—"}</span>
+                      <span className="text-sm text-zinc-700 dark:text-zinc-300">{w.chinese || "—"}</span>
+                    </div>
+                    <p className="mt-2 text-[11px] text-zinc-400">泰文 / 音标 / 中文来自词表（不可编辑）</p>
+
+                    <div className="mt-4 grid gap-4 sm:grid-cols-3">
+                      {[1, 2, 3].map((n) => {
+                        const thaiK = `ex${n}Thai` as keyof Next30DraftRow;
+                        const ipaK = `ex${n}Ipa` as keyof Next30DraftRow;
+                        const zhK = `ex${n}Zh` as keyof Next30DraftRow;
+                        const opt = n > 1 ? "（可选）" : "";
+                        return (
+                          <fieldset
+                            key={n}
+                            className="rounded-lg border border-zinc-100 p-3 dark:border-zinc-800"
+                          >
+                            <legend className="px-1 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                              例句{n}
+                              {opt}
+                            </legend>
+                            <label className="mt-2 block">
+                              <span className={lab}>泰文例句{opt}</span>
+                              <input
+                                className={inp}
+                                value={String(d[thaiK])}
+                                onChange={(e) => patchDraft(idx, { [thaiK]: e.target.value } as Partial<Next30DraftRow>)}
+                              />
+                            </label>
+                            <label className="mt-2 block">
+                              <span className={lab}>音标{opt}</span>
+                              <input
+                                className={inp}
+                                value={String(d[ipaK])}
+                                onChange={(e) => patchDraft(idx, { [ipaK]: e.target.value } as Partial<Next30DraftRow>)}
+                              />
+                            </label>
+                            <label className="mt-2 block">
+                              <span className={lab}>中文翻译{opt}</span>
+                              <input
+                                className={inp}
+                                value={String(d[zhK])}
+                                onChange={(e) => patchDraft(idx, { [zhK]: e.target.value } as Partial<Next30DraftRow>)}
+                              />
+                            </label>
+                          </fieldset>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
 
