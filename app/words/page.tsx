@@ -11,7 +11,7 @@ const DEFAULT_EXCEL = "/Users/zhongzihang/Downloads/泰语高频词0226.xlsx";
 const DEFAULT_ANKI =
   "/Users/zhongzihang/Library/Application Support/Anki2/账户 1/collection.anki2";
 
-type FilterKey = "all" | "pending" | "supplement" | "deletable" | "done";
+type FilterKey = "all" | "pending" | "supplement" | "deletable" | "done" | "judged";
 
 function statusBadgeClass(s: WordRow["status"]): string {
   switch (s) {
@@ -23,20 +23,21 @@ function statusBadgeClass(s: WordRow["status"]): string {
       return "bg-rose-100 text-rose-900 dark:bg-rose-950/50 dark:text-rose-200";
     case "done":
       return "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/50 dark:text-emerald-200";
+    case "judged":
+      return "bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-100";
     default:
       return "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400";
   }
 }
 
 function pickNext30(words: WordRow[]): WordRow[] {
-  const sup = words
-    .filter((w) => w.status === "supplement")
-    .sort((a, b) => b.frequency - a.frequency);
   const pen = words
     .filter((w) => w.status === "pending")
     .sort((a, b) => b.frequency - a.frequency);
-  const merged = [...sup, ...pen];
-  return merged.slice(0, 30);
+  const sup = words
+    .filter((w) => w.status === "supplement")
+    .sort((a, b) => b.frequency - a.frequency);
+  return [...pen, ...sup].slice(0, 30);
 }
 
 export default function WordsPage() {
@@ -95,7 +96,15 @@ export default function WordsPage() {
         setWords([]);
         return;
       }
-      setStats(data.stats ?? null);
+      const s = data.stats;
+      setStats(
+        s
+          ? {
+              ...s,
+              judged: s.judged ?? 0,
+            }
+          : null
+      );
       setWords(data.words ?? []);
     } catch {
       setError("网络或服务器错误");
@@ -127,6 +136,7 @@ export default function WordsPage() {
     { key: "supplement", label: "需补充" },
     { key: "deletable", label: "可删除" },
     { key: "done", label: "已完成" },
+    { key: "judged", label: "已判断" },
   ];
 
   return (
@@ -198,6 +208,11 @@ export default function WordsPage() {
               已完成{" "}
               <strong className="tabular-nums text-emerald-700 dark:text-emerald-400">{stats.done}</strong>
             </span>
+            <span className="text-zinc-300 dark:text-zinc-600">|</span>
+            <span>
+              已判断{" "}
+              <strong className="tabular-nums text-slate-600 dark:text-slate-400">{stats.judged ?? 0}</strong>
+            </span>
           </div>
 
           <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -223,7 +238,7 @@ export default function WordsPage() {
           {next30Visible && (
             <div className="mt-4 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
               <p className="text-xs font-medium text-zinc-500">
-                优先「需补充例句」，再「待录入」；同组内按出现频次从高到低。共 {next30.length} 个。
+                优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。共 {next30.length} 个。
               </p>
               <p className="mt-2 font-mono text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
                 {next30.map((w) => w.thai).join("、")}
@@ -283,7 +298,9 @@ export default function WordsPage() {
                       </span>
                     </td>
                     <td className="px-3 py-2 tabular-nums text-zinc-600">{w.requiredLabel}</td>
-                    <td className="px-3 py-2 tabular-nums text-zinc-600">{w.ankiExampleCount}</td>
+                    <td className="px-3 py-2 tabular-nums text-zinc-600">
+                      {w.ankiNoteCount ?? w.ankiExampleCount ?? 0}
+                    </td>
                   </tr>
                 ))}
               </tbody>

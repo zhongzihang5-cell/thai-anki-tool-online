@@ -12,11 +12,15 @@ export type WordRow = {
   need2: boolean;
   need3: boolean;
   deletable: boolean;
+  remarkJudged?: boolean;
   requiredExamples: number;
   requiredLabel: string;
   inAnki: boolean;
-  ankiExampleCount: number;
-  status: "pending" | "supplement" | "deletable" | "done" | "idle";
+  /** Anki：泰文例句在 index 5、10、15…（步长 5）；该位非空且非纯 [sound:] 则计 1 条 */
+  ankiNoteCount: number;
+  /** 与 ankiNoteCount 相同 */
+  ankiExampleCount?: number;
+  status: "pending" | "supplement" | "deletable" | "done" | "idle" | "judged";
   statusLabel: string;
 };
 
@@ -25,6 +29,7 @@ export type WordsCatalogStats = {
   supplement: number;
   deletable: number;
   done: number;
+  judged: number;
 };
 
 export type WordsCatalogResponse = {
