@@ -34,6 +34,69 @@ def normalize(s: str) -> str:
     return "".join(s.split())
 
 
+# Thai month names in sermon/article datelines (order matches calendar)
+_THAI_MONTHS: tuple[str, ...] = (
+    "มกราคม",
+    "กุมภาพันธ์",
+    "มีนาคม",
+    "เมษายน",
+    "พฤษภาคม",
+    "มิถุนายน",
+    "กรกฎาคม",
+    "สิงหาคม",
+    "กันยายน",
+    "ตุลาคม",
+    "พฤศจิกายน",
+    "ธันวาคม",
+)
+
+_REV_THAI_DIGIT_TRANS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+
+
+def _thai_digit_str_to_int(s: str) -> int:
+    return int(s.translate(_REV_THAI_DIGIT_TRANS))
+
+
+def _to_buddhist_era_year(y: int) -> int:
+    """Treat 1900–2199 as Christian era (rare); otherwise assume already BE."""
+    if 1900 <= y <= 2199:
+        return y + 543
+    return y
+
+
+def extract_official_youtube_date_phrase(raw: str) -> str | None:
+    """
+    Official articles usually put the dateline at the end, e.g. '3 กรกฎาคม 2564'
+    or 'วันที่ 31 สิงหาคม 2542'. Scan from the last lines upward; Arabic or Thai digits.
+    Returns phrase for YouTube search: '<day> <month> <BE year>' (Arabic numerals).
+    """
+    months_pat = "|".join(re.escape(m) for m in _THAI_MONTHS)
+    pat = re.compile(
+        rf"(?:วันที่\s*)?([\d๐-๙]{{1,2}})\s+({months_pat})\s*(?:พ\.ศ\.?\s*)?([\d๐-๙]{{4}})"
+    )
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    tail = lines[-120:] if len(lines) > 120 else lines
+    for line in reversed(tail):
+        m = pat.search(line)
+        if not m:
+            continue
+        try:
+            day = _thai_digit_str_to_int(m.group(1))
+            month = m.group(2)
+            year_raw = _thai_digit_str_to_int(m.group(3))
+        except ValueError:
+            continue
+        if not 1 <= day <= 31:
+            continue
+        be_year = _to_buddhist_era_year(year_raw)
+        if not 2400 <= be_year <= 2700:
+            continue
+        return f"{day} {month} {be_year}"
+    return None
+
+
 def has_chinese(s: str) -> bool:
     return CHINESE_RE.search(s) is not None
 
@@ -148,7 +211,7 @@ def find_matches_in_file(
         return None
 
     label = f"{'官网' if kind == 'official' else '公众号'} · {path.name}"
-    return {
+    out: dict[str, Any] = {
         "path": str(path.resolve()),
         "fileName": path.name,
         "sourceLabel": label,
@@ -158,6 +221,11 @@ def find_matches_in_file(
         "hasChinese": any(has_chinese(s) for s in hits),
         "sentences": hits,
     }
+    if kind == "official":
+        dt = extract_official_youtube_date_phrase(raw)
+        if dt:
+            out["youtubeSearchDatePhrase"] = dt
+    return out
 
 
 def search_word(
@@ -231,7 +299,7 @@ def _article_record_from_map(data: dict[str, Any], ordered: list[str]) -> dict[s
                 "hasChinese": any(has_chinese(s) for s in sents),
             }
         )
-    return {
+    rec: dict[str, Any] = {
         "path": data["path"],
         "fileName": data["fileName"],
         "sourceLabel": data["sourceLabel"],
@@ -241,6 +309,9 @@ def _article_record_from_map(data: dict[str, Any], ordered: list[str]) -> dict[s
         "wordCount": len(word_entries),
         "words": word_entries,
     }
+    if data.get("youtubeSearchDatePhrase"):
+        rec["youtubeSearchDatePhrase"] = data["youtubeSearchDatePhrase"]
+    return rec
 
 
 def _build_article_map(ordered: list[str], cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -257,7 +328,10 @@ def _build_article_map(ordered: list[str], cfg: dict[str, Any]) -> dict[str, dic
                     "hasAudio": r["hasAudio"],
                     "audioIcon": r["audioIcon"],
                     "wordMap": {},
+                    "youtubeSearchDatePhrase": r.get("youtubeSearchDatePhrase"),
                 }
+            elif not by_path[p].get("youtubeSearchDatePhrase") and r.get("youtubeSearchDatePhrase"):
+                by_path[p]["youtubeSearchDatePhrase"] = r["youtubeSearchDatePhrase"]
             by_path[p]["wordMap"][w] = r["sentences"]
     return by_path
 

@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+
+import { TAB_PERSIST } from "@/lib/useStickyTabState";
 
 import {
   buildAnkiImportCsv,
@@ -11,7 +13,11 @@ import {
   type Next30DraftRow,
 } from "@/lib/ankiCsvExport";
 import { pickNext30 } from "@/lib/pickNext30";
-import type { SingleSearchResult } from "@/lib/runArticleSearch";
+import type {
+  ByArticleArticle,
+  ByArticleWordHit,
+  SingleSearchResult,
+} from "@/lib/runArticleSearch";
 import type { WordRow } from "@/lib/runWordsCatalog";
 
 const LS_EXCEL = "thai-anki-words-excel";
@@ -20,15 +26,31 @@ const DEFAULT_EXCEL = "/Users/zhongzihang/Desktop/泰语高频词0226.xlsx";
 const DEFAULT_ANKI =
   "/Users/zhongzihang/Library/Application Support/Anki2/账户 1/collection.anki2";
 
+const WS_KEY = TAB_PERSIST.workspace;
+
 function fileUrlFromPath(abs: string): string {
   const n = abs.replace(/\\/g, "/");
   return n.startsWith("/") ? `file://${n}` : `file:///${n}`;
 }
 
-function youtubeSearchQuery(wordThai: string, sentence: string): string {
+/** 与 scripts/search_articles.py 中 normalize 一致：去掉所有空白 */
+function thaiNormKey(s: string): string {
+  return s.replace(/\s/g, "");
+}
+
+function youtubeSearchQuery(
+  wordThai: string,
+  sentence: string,
+  source: Pick<SingleSearchResult, "kind" | "youtubeSearchDatePhrase">
+): string {
   const s = sentence.trim().replace(/\s+/g, " ");
   const clip = s.length > 160 ? s.slice(0, 160) + "…" : s;
-  return `${wordThai.trim()} ${clip}`.trim();
+  const w = wordThai.trim();
+  const date = source.youtubeSearchDatePhrase?.trim();
+  if (source.kind === "official" && date) {
+    return `${w} ${date} ${clip}`.trim();
+  }
+  return `${w} ${clip}`.trim();
 }
 
 function applySentenceToDraft(d: Next30DraftRow, sentence: string): Next30DraftRow {
@@ -38,6 +60,25 @@ function applySentenceToDraft(d: Next30DraftRow, sentence: string): Next30DraftR
   if (!d.ex2Thai.trim()) return { ...d, ex2Thai: s };
   if (!d.ex3Thai.trim()) return { ...d, ex3Thai: s };
   return { ...d, ex1Thai: s };
+}
+
+function articleWordHitToResult(
+  article: ByArticleArticle,
+  hit: ByArticleWordHit
+): SingleSearchResult {
+  return {
+    path: article.path,
+    fileName: article.fileName,
+    sourceLabel: article.sourceLabel,
+    kind: article.kind === "wechat" ? "wechat" : "official",
+    hasAudio: article.hasAudio,
+    audioIcon: article.audioIcon,
+    hasChinese: hit.hasChinese,
+    sentences: hit.sentences,
+    ...(article.youtubeSearchDatePhrase
+      ? { youtubeSearchDatePhrase: article.youtubeSearchDatePhrase }
+      : {}),
+  };
 }
 
 export default function WorkspacePage() {
@@ -50,6 +91,11 @@ export default function WorkspacePage() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [searchResults, setSearchResults] = useState<SingleSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
+  const [coverPlan, setCoverPlan] = useState<ByArticleArticle[] | null>(null);
+  const [coverWordsKey, setCoverWordsKey] = useState("");
+  const [coverLoading, setCoverLoading] = useState(false);
+  const [searchCache, setSearchCache] = useState<Record<string, SingleSearchResult[]>>({});
+  const [wsBootstrapped, setWsBootstrapped] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const selectedWord = queue30[selectedIndex] ?? null;
@@ -58,61 +104,215 @@ export default function WorkspacePage() {
     [queue30, drafts]
   );
 
-  const loadWords = useCallback(async () => {
-    try {
-      localStorage.setItem(LS_EXCEL, excelPath);
-      localStorage.setItem(LS_ANKI, ankiPath);
-    } catch {
-      /* ignore */
+  /** 当前词在「本批30词贪心覆盖计划」中的来源，顺序与 /api/by-article 一致（含音频优先已由后端排序） */
+  const greedyOrderedForWord = useMemo(() => {
+    if (!selectedWord || !coverPlan?.length) return [];
+    const key = thaiNormKey(selectedWord.thai);
+    const out: SingleSearchResult[] = [];
+    for (const art of coverPlan) {
+      const hit = art.words.find((h) => thaiNormKey(h.word) === key);
+      if (hit) out.push(articleWordHitToResult(art, hit));
     }
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/words", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ excelPath, ankiDbPath: ankiPath }),
-      });
-      const data = (await res.json()) as { words?: WordRow[]; error?: string };
-      if (!res.ok) {
-        setError(data.error || `加载失败 (${res.status})`);
+    return out;
+  }, [selectedWord, coverPlan]);
+
+  const displaySearchResults = useMemo(() => {
+    const seen = new Set(greedyOrderedForWord.map((r) => r.path));
+    const rest = searchResults.filter((r) => !seen.has(r.path));
+    return [...greedyOrderedForWord, ...rest];
+  }, [greedyOrderedForWord, searchResults]);
+
+  const loadWords = useCallback(
+    async (pathOverride?: { excelPath: string; ankiPath: string }) => {
+      const ex = pathOverride?.excelPath ?? excelPath;
+      const an = pathOverride?.ankiPath ?? ankiPath;
+      try {
+        localStorage.setItem(LS_EXCEL, ex);
+        localStorage.setItem(LS_ANKI, an);
+      } catch {
+        /* ignore */
+      }
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await fetch("/api/words", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ excelPath: ex, ankiDbPath: an }),
+        });
+        const data = (await res.json()) as { words?: WordRow[]; error?: string };
+        if (!res.ok) {
+          setError(data.error || `加载失败 (${res.status})`);
+          setQueue30([]);
+          setDrafts([]);
+          return;
+        }
+        const list = data.words ?? [];
+        const picked = pickNext30(list);
+        setQueue30(picked);
+        setDrafts(picked.map(() => emptyDraft()));
+        setSelectedIndex(0);
+        setCoverPlan(null);
+        setCoverWordsKey("");
+        setSearchCache({});
+      } catch {
+        setError("网络错误");
         setQueue30([]);
         setDrafts([]);
-        return;
+      } finally {
+        setLoading(false);
       }
-      const list = data.words ?? [];
-      const picked = pickNext30(list);
-      setQueue30(picked);
-      setDrafts(picked.map(() => emptyDraft()));
-      setSelectedIndex(0);
-    } catch {
-      setError("网络错误");
-      setQueue30([]);
-      setDrafts([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [excelPath, ankiPath]);
+    },
+    [excelPath, ankiPath]
+  );
 
+  const loadWordsRef = useRef(loadWords);
+  loadWordsRef.current = loadWords;
+
+  /** 路径、工作台缓存或首次拉取词表（仅挂载一次） */
   useEffect(() => {
+    let ex = DEFAULT_EXCEL;
+    let an = DEFAULT_ANKI;
     try {
       const e = localStorage.getItem(LS_EXCEL);
       const a = localStorage.getItem(LS_ANKI);
-      if (e) setExcelPath(e);
-      if (a) setAnkiPath(a);
+      if (e) {
+        ex = e;
+        setExcelPath(e);
+      }
+      if (a) {
+        an = a;
+        setAnkiPath(a);
+      }
     } catch {
       /* ignore */
     }
+
+    let restored = false;
+    try {
+      const raw = localStorage.getItem(WS_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as {
+          queue30?: WordRow[];
+          drafts?: Next30DraftRow[];
+          selectedIndex?: number;
+          coverPlan?: ByArticleArticle[] | null;
+          coverWordsKey?: string;
+          searchCache?: Record<string, SingleSearchResult[]>;
+        };
+        if (Array.isArray(p.queue30) && p.queue30.length > 0) {
+          setQueue30(p.queue30);
+          setDrafts(
+            Array.isArray(p.drafts) && p.drafts.length === p.queue30.length
+              ? p.drafts
+              : p.queue30.map(() => emptyDraft())
+          );
+          const si = typeof p.selectedIndex === "number" ? p.selectedIndex : 0;
+          setSelectedIndex(Math.min(Math.max(0, si), p.queue30.length - 1));
+          if (Array.isArray(p.coverPlan)) setCoverPlan(p.coverPlan);
+          else setCoverPlan(null);
+          setCoverWordsKey(typeof p.coverWordsKey === "string" ? p.coverWordsKey : "");
+          if (p.searchCache && typeof p.searchCache === "object") setSearchCache(p.searchCache);
+          setLoading(false);
+          restored = true;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    setWsBootstrapped(true);
+    if (!restored) {
+      void loadWordsRef.current({ excelPath: ex, ankiPath: an });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载时：恢复工作台或首次加载
   }, []);
 
   useEffect(() => {
-    loadWords();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- 仅首屏加载；路径变更用按钮刷新
+    if (!wsBootstrapped) return;
+    try {
+      localStorage.setItem(
+        WS_KEY,
+        JSON.stringify({
+          queue30,
+          drafts,
+          selectedIndex,
+          coverPlan,
+          coverWordsKey,
+          searchCache,
+        })
+      );
+    } catch {
+      /* quota */
+    }
+  }, [wsBootstrapped, queue30, drafts, selectedIndex, coverPlan, coverWordsKey, searchCache]);
+
+  const queueWordsKey = useMemo(
+    () => queue30.map((row) => row.thai.trim()).filter(Boolean).join("\0"),
+    [queue30]
+  );
+
+  /** 与本批 30 词相同的贪心最小覆盖；有缓存且 batch 未变则不再请求 */
+  useEffect(() => {
+    if (!wsBootstrapped) return;
+    if (queue30.length === 0) {
+      setCoverPlan(null);
+      setCoverWordsKey("");
+      setCoverLoading(false);
+      return;
+    }
+    if (!queueWordsKey) {
+      setCoverPlan(null);
+      setCoverLoading(false);
+      return;
+    }
+    if (coverPlan !== null && coverWordsKey === queueWordsKey) {
+      setCoverLoading(false);
+      return;
+    }
+    const words = queue30.map((row) => row.thai.trim()).filter(Boolean);
+    let cancelled = false;
+    setCoverLoading(true);
+    fetch("/api/by-article", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ words }),
+    })
+      .then((r) => r.json())
+      .then((data: { articles?: ByArticleArticle[]; error?: string }) => {
+        if (cancelled) return;
+        setCoverPlan(data.articles ?? []);
+        setCoverWordsKey(queueWordsKey);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCoverPlan([]);
+          setCoverWordsKey(queueWordsKey);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCoverLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [queue30, queueWordsKey, wsBootstrapped, coverPlan, coverWordsKey]);
+
+  const searchCacheRef = useRef(searchCache);
+  searchCacheRef.current = searchCache;
 
   useEffect(() => {
+    if (!wsBootstrapped) return;
     const w = selectedWord;
     if (!w) {
       setSearchResults([]);
+      return;
+    }
+    const thai = w.thai;
+    const cache = searchCacheRef.current;
+    if (Object.prototype.hasOwnProperty.call(cache, thai)) {
+      setSearchResults(cache[thai]!);
+      setSearchLoading(false);
       return;
     }
     let cancelled = false;
@@ -121,11 +321,14 @@ export default function WorkspacePage() {
     fetch("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: w.thai }),
+      body: JSON.stringify({ query: thai }),
     })
       .then((r) => r.json())
       .then((data: { results?: SingleSearchResult[] }) => {
-        if (!cancelled) setSearchResults(data.results ?? []);
+        if (cancelled) return;
+        const results = data.results ?? [];
+        setSearchResults(results);
+        setSearchCache((c) => ({ ...c, [thai]: results }));
       })
       .catch(() => {
         if (!cancelled) setSearchResults([]);
@@ -136,7 +339,7 @@ export default function WorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedWord]);
+  }, [selectedWord, wsBootstrapped]);
 
   function patchDraft(patch: Partial<Next30DraftRow>) {
     setDrafts((prev) =>
@@ -163,9 +366,9 @@ export default function WorkspacePage() {
     }
   }
 
-  async function copyYoutubeQuery(sentence: string) {
+  async function copyYoutubeQuery(sentence: string, source: SingleSearchResult) {
     if (!selectedWord) return;
-    const q = youtubeSearchQuery(selectedWord.thai, sentence);
+    const q = youtubeSearchQuery(selectedWord.thai, sentence, source);
     try {
       await navigator.clipboard.writeText(q);
       setToast("已复制 YouTube 搜索词");
@@ -208,7 +411,7 @@ export default function WorkspacePage() {
           </span>
           <button
             type="button"
-            onClick={loadWords}
+            onClick={() => void loadWords()}
             disabled={loading}
             className="rounded-md bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
           >
@@ -274,15 +477,24 @@ export default function WorkspacePage() {
                 <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
                   例句搜索结果 · {selectedWord.thai}
                 </h2>
-                {searchLoading ? (
-                  <p className="mt-4 text-sm text-zinc-500">搜索中…</p>
-                ) : searchResults.length === 0 ? (
+                <p className="mt-1 text-[11px] text-zinc-400">
+                  已按本批 30 词的贪心最小覆盖计划优先展示（与「按文章聚合」同源）；其余命中排在后面。切换顶部导航会保留队列、草稿与搜索缓存。
+                </p>
+                {displaySearchResults.length === 0 && (searchLoading || coverLoading) ? (
+                  <p className="mt-4 text-sm text-zinc-500">
+                    {searchLoading && coverLoading
+                      ? "搜索与覆盖计划中…"
+                      : searchLoading
+                        ? "搜索中…"
+                        : "加载覆盖计划中…"}
+                  </p>
+                ) : displaySearchResults.length === 0 ? (
                   <p className="mt-4 text-sm text-zinc-500">未找到例句</p>
                 ) : (
                   <ul className="mt-3 space-y-4">
-                    {searchResults.map((r) => (
+                    {displaySearchResults.map((r, i) => (
                       <li
-                        key={r.path}
+                        key={`${r.path}-${i}`}
                         className={`rounded-lg border p-3 ${
                           r.hasAudio
                             ? "border-emerald-300/80 bg-emerald-50/50 dark:border-emerald-800 dark:bg-emerald-950/20"
@@ -314,7 +526,7 @@ export default function WorkspacePage() {
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() => copyYoutubeQuery(sent)}
+                                  onClick={() => copyYoutubeQuery(sent, r)}
                                   className="rounded border border-zinc-300 px-2 py-0.5 text-[11px] dark:border-zinc-600"
                                 >
                                   复制YouTube搜索词

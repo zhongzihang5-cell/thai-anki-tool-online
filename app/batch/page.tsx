@@ -2,6 +2,8 @@
 
 import { useMemo, useState } from "react";
 
+import { TAB_PERSIST, useStickyTabState } from "@/lib/useStickyTabState";
+
 type BatchItem = {
   word: string;
   status: string;
@@ -28,11 +30,15 @@ function downloadTxt(content: string, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+type BatchPersist = { text: string; items: BatchItem[]; error: string | null };
+
+const BATCH_INITIAL: BatchPersist = { text: "", items: [], error: null };
+
 export default function BatchPage() {
-  const [text, setText] = useState("");
+  const [snap, setSnap] = useStickyTabState<BatchPersist>(TAB_PERSIST.batch, BATCH_INITIAL);
+  const { text, items, error } = snap;
+  const setText = (v: string) => setSnap((s) => ({ ...s, text: v }));
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [items, setItems] = useState<BatchItem[]>([]);
 
   const lines = useMemo(
     () =>
@@ -46,8 +52,7 @@ export default function BatchPage() {
   async function runBatch() {
     if (lines.length === 0) return;
     setLoading(true);
-    setError(null);
-    setItems([]);
+    setSnap((s) => ({ ...s, error: null, items: [] }));
     try {
       const res = await fetch("/api/batch-search", {
         method: "POST",
@@ -56,12 +61,12 @@ export default function BatchPage() {
       });
       const data = (await res.json()) as { items?: BatchItem[]; error?: string };
       if (!res.ok) {
-        setError(data.error || `请求失败 (${res.status})`);
+        setSnap((s) => ({ ...s, error: data.error || `请求失败 (${res.status})` }));
         return;
       }
-      setItems(data.items || []);
+      setSnap((s) => ({ ...s, items: data.items || [] }));
     } catch {
-      setError("网络或服务器错误");
+      setSnap((s) => ({ ...s, error: "网络或服务器错误" }));
     } finally {
       setLoading(false);
     }
@@ -78,6 +83,7 @@ export default function BatchPage() {
       <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50">批量搜索</h1>
       <p className="mt-1 text-sm text-zinc-500">
         每行一个词语。状态：已有音频（任一命中来源带 🎵）、需找 YouTube（有命中但无音频）、未找到。
+        <span className="text-zinc-400"> 切换顶部导航会保留列表与结果。</span>
       </p>
 
       <label className="mt-6 block">

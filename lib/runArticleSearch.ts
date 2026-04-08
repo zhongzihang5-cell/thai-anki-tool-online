@@ -12,6 +12,8 @@ export type SingleSearchResult = {
   audioIcon: string;
   hasChinese: boolean;
   sentences: string[];
+  /** 官网文末日期，用于 YouTube 搜索（如 3 กรกฎาคม 2564） */
+  youtubeSearchDatePhrase?: string;
 };
 
 export type SingleSearchResponse = {
@@ -48,6 +50,7 @@ export type ByArticleArticle = {
   words: ByArticleWordHit[];
   /** Words first covered at this greedy step (processing order) */
   newlyCoveredWords?: string[];
+  youtubeSearchDatePhrase?: string;
 };
 
 export type ByArticleResponse = {

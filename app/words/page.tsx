@@ -8,8 +8,9 @@ import {
   emptyDraft,
   type Next30DraftRow,
 } from "@/lib/ankiCsvExport";
-import { pickNext30 } from "@/lib/pickNext30";
+import { pickNext30, thaiWordKey } from "@/lib/pickNext30";
 import type { WordRow, WordsCatalogStats } from "@/lib/runWordsCatalog";
+import { TAB_PERSIST, useStickyTabState } from "@/lib/useStickyTabState";
 
 const LS_EXCEL = "thai-anki-words-excel";
 const LS_ANKI = "thai-anki-words-anki";
@@ -19,6 +20,26 @@ const DEFAULT_ANKI =
   "/Users/zhongzihang/Library/Application Support/Anki2/账户 1/collection.anki2";
 
 type FilterKey = "all" | "pending" | "supplement" | "deletable" | "done" | "judged";
+
+type WordsPersist = {
+  filter: FilterKey;
+  words: WordRow[];
+  stats: WordsCatalogStats | null;
+  next30: WordRow[];
+  next30Drafts: Next30DraftRow[];
+  next30Visible: boolean;
+  error: string | null;
+};
+
+const WORDS_INITIAL: WordsPersist = {
+  filter: "all",
+  words: [],
+  stats: null,
+  next30: [],
+  next30Drafts: [],
+  next30Visible: false,
+  error: null,
+};
 
 function statusBadgeClass(s: WordRow["status"]): string {
   switch (s) {
@@ -41,14 +62,16 @@ export default function WordsPage() {
   const [excelPath, setExcelPath] = useState(DEFAULT_EXCEL);
   const [ankiPath, setAnkiPath] = useState(DEFAULT_ANKI);
 
+  const [snap, setSnap] = useStickyTabState<WordsPersist>(TAB_PERSIST.words, WORDS_INITIAL);
+  const { filter, stats, next30Visible, error } = snap;
+  /** localStorage 旧数据可能缺字段或非数组，避免 words.length 抛错导致整页无响应 */
+  const words = Array.isArray(snap.words) ? snap.words : [];
+  const next30 = Array.isArray(snap.next30) ? snap.next30 : [];
+  const next30Drafts =
+    Array.isArray(snap.next30Drafts) && snap.next30Drafts.length === next30.length
+      ? snap.next30Drafts
+      : next30.map(() => emptyDraft());
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [stats, setStats] = useState<WordsCatalogStats | null>(null);
-  const [words, setWords] = useState<WordRow[]>([]);
-  const [filter, setFilter] = useState<FilterKey>("all");
-  const [next30, setNext30] = useState<WordRow[]>([]);
-  const [next30Drafts, setNext30Drafts] = useState<Next30DraftRow[]>([]);
-  const [next30Visible, setNext30Visible] = useState(false);
 
   const filtered = useMemo(() => {
     if (filter === "all") return words;
@@ -74,10 +97,13 @@ export default function WordsPage() {
       /* ignore */
     }
     setLoading(true);
-    setError(null);
-    setNext30Visible(false);
-    setNext30([]);
-    setNext30Drafts([]);
+    setSnap((s) => ({
+      ...s,
+      error: null,
+      next30Visible: false,
+      next30: [],
+      next30Drafts: [],
+    }));
     try {
       const res = await fetch("/api/words", {
         method: "POST",
@@ -90,41 +116,81 @@ export default function WordsPage() {
         error?: string;
       };
       if (!res.ok) {
-        setError(data.error || `请求失败 (${res.status})`);
-        setStats(null);
-        setWords([]);
+        setSnap((s) => ({
+          ...s,
+          error: data.error || `请求失败 (${res.status})`,
+          stats: null,
+          words: [],
+        }));
         return;
       }
       const s = data.stats;
-      setStats(
-        s
+      setSnap((prev) => ({
+        ...prev,
+        stats: s
           ? {
               ...s,
               judged: s.judged ?? 0,
             }
-          : null
-      );
-      setWords(data.words ?? []);
+          : null,
+        words: data.words ?? [],
+      }));
     } catch {
-      setError("网络或服务器错误");
-      setStats(null);
-      setWords([]);
+      setSnap((s) => ({
+        ...s,
+        error: "网络或服务器错误",
+        stats: null,
+        words: [],
+      }));
     } finally {
       setLoading(false);
     }
   }
 
   function handleNext30() {
-    const picked = pickNext30(words);
-    setNext30(picked);
-    setNext30Drafts(picked.map(() => emptyDraft()));
-    setNext30Visible(true);
+    setSnap((s) => {
+      const list = Array.isArray(s.words) ? s.words : [];
+      if (list.length === 0) {
+        return {
+          ...s,
+          error: "请先到上方点击「加载数据」，确认 /api/words 返回词表后再获取待处理词。",
+        };
+      }
+      const prev = Array.isArray(s.next30) ? s.next30 : [];
+      const exclude = new Set(prev.map((w) => thaiWordKey(w.thai)));
+      const picked = pickNext30(list, exclude);
+      if (picked.length === 0) {
+        return {
+          ...s,
+          error:
+            exclude.size > 0
+              ? "当前列表里的待处理词已全部展示过，没有更多未展示的待录入/需补充词。可先处理完或点击「加载数据」刷新词表。"
+              : "词表中没有状态为「待录入」或「需补充例句」的词。",
+        };
+      }
+      return {
+        ...s,
+        next30: picked,
+        next30Drafts: picked.map(() => emptyDraft()),
+        next30Visible: true,
+        error: null,
+      };
+    });
   }
 
   function patchDraft(index: number, patch: Partial<Next30DraftRow>) {
-    setNext30Drafts((prev) =>
-      prev.map((row, i) => (i === index ? { ...row, ...patch } : row))
-    );
+    setSnap((s) => {
+      const n30 = Array.isArray(s.next30) ? s.next30 : [];
+      let drafts = Array.isArray(s.next30Drafts) ? [...s.next30Drafts] : [];
+      while (drafts.length < n30.length) drafts.push(emptyDraft());
+      drafts = drafts.slice(0, n30.length);
+      return {
+        ...s,
+        next30Drafts: drafts.map((row, i) =>
+          i === index ? { ...row, ...patch } : row
+        ),
+      };
+    });
   }
 
   function handleGenerateCsv() {
@@ -139,7 +205,7 @@ export default function WordsPage() {
     try {
       await navigator.clipboard.writeText(text);
     } catch {
-      setError("复制失败，请检查浏览器权限");
+      setSnap((s) => ({ ...s, error: "复制失败，请检查浏览器权限" }));
     }
   }
 
@@ -157,6 +223,7 @@ export default function WordsPage() {
       <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50">单词管理</h1>
       <p className="mt-1 text-sm text-zinc-500">
         Excel 词表与 Anki 牌组对照。路径可修改，会保存在本机浏览器。
+        <span className="text-zinc-400"> 切换顶部导航会保留上次加载的数据与下 30 个草稿。</span>
       </p>
 
       <div className="mt-6 grid gap-3 sm:grid-cols-2">
@@ -232,7 +299,12 @@ export default function WordsPage() {
             <button
               type="button"
               onClick={handleNext30}
-              disabled={words.length === 0}
+              disabled={loading}
+              title={
+                words.length === 0
+                  ? "请先点击「加载数据」"
+                  : "再次点击会跳过当前列表中已展示的词，取下一批"
+              }
               className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition enabled:hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:enabled:hover:bg-zinc-800"
             >
               获取下30个待处理
@@ -261,7 +333,7 @@ export default function WordsPage() {
             <div className="mt-4 space-y-4">
               <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
                 <p className="text-xs font-medium text-zinc-500">
-                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。共 {next30.length}{" "}
+                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。再次点击「获取下30个待处理」会跳过本页当前列表里已展示的词，取下一批。共 {next30.length}{" "}
                   个。填写例句后点「生成导入CSV」：20 列，音频列为{" "}
                   <code className="rounded bg-zinc-100 px-1 font-mono text-[10px] dark:bg-zinc-800">
                     [sound:对应文字.wav]
@@ -347,7 +419,7 @@ export default function WordsPage() {
               <button
                 key={t.key}
                 type="button"
-                onClick={() => setFilter(t.key)}
+                onClick={() => setSnap((s) => ({ ...s, filter: t.key }))}
                 className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
                   filter === t.key
                     ? "bg-white text-zinc-900 shadow dark:bg-zinc-900 dark:text-zinc-50"

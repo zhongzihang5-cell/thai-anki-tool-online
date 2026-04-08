@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 
 import type { ByArticleArticle } from "@/lib/runArticleSearch";
+import { TAB_PERSIST, useStickyTabState } from "@/lib/useStickyTabState";
 
 function extractArticleNumber(a: ByArticleArticle): string {
   const base = a.fileName.replace(/\.[^.]+$/i, "");
@@ -21,19 +22,51 @@ function sourceShort(a: ByArticleArticle): string {
   return a.kind;
 }
 
+type ByArticlePersist = {
+  text: string;
+  error: string | null;
+  articles: ByArticleArticle[];
+  inputWordCount: number;
+  totalArticles: number;
+  withAudioCount: number;
+  youtubeCount: number;
+  uncoveredWords: string[];
+  searched: boolean;
+  /** JSON storage uses string keys */
+  openDetails: Record<string, boolean>;
+};
+
+const BY_ARTICLE_INITIAL: ByArticlePersist = {
+  text: "",
+  error: null,
+  articles: [],
+  inputWordCount: 0,
+  totalArticles: 0,
+  withAudioCount: 0,
+  youtubeCount: 0,
+  uncoveredWords: [],
+  searched: false,
+  openDetails: {},
+};
+
 export default function ByArticlePage() {
-  const [text, setText] = useState("");
+  const [snap, setSnap] = useStickyTabState<ByArticlePersist>(
+    TAB_PERSIST.byArticle,
+    BY_ARTICLE_INITIAL
+  );
+  const {
+    text,
+    error,
+    articles,
+    inputWordCount,
+    totalArticles,
+    withAudioCount,
+    youtubeCount,
+    uncoveredWords,
+    searched,
+    openDetails,
+  } = snap;
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [articles, setArticles] = useState<ByArticleArticle[]>([]);
-  const [inputWordCount, setInputWordCount] = useState(0);
-  const [totalArticles, setTotalArticles] = useState(0);
-  const [withAudioCount, setWithAudioCount] = useState(0);
-  const [youtubeCount, setYoutubeCount] = useState(0);
-  const [uncoveredWords, setUncoveredWords] = useState<string[]>([]);
-  const [searched, setSearched] = useState(false);
-  /** Native details open state is browser-owned; React 19 can mismatch on hydrate — use controlled panels. */
-  const [openDetails, setOpenDetails] = useState<Record<number, boolean>>({});
 
   const coveredWordCount = useMemo(
     () => Math.max(0, inputWordCount - uncoveredWords.length),
@@ -50,7 +83,8 @@ export default function ByArticlePage() {
   );
 
   function scrollToDetail(index: number) {
-    setOpenDetails((d) => ({ ...d, [index]: true }));
+    const k = String(index);
+    setSnap((s) => ({ ...s, openDetails: { ...s.openDetails, [k]: true } }));
     requestAnimationFrame(() => {
       document.getElementById(`by-article-detail-${index}`)?.scrollIntoView({
         behavior: "smooth",
@@ -62,15 +96,18 @@ export default function ByArticlePage() {
   async function runSearch() {
     if (lines.length === 0) return;
     setLoading(true);
-    setError(null);
-    setArticles([]);
-    setInputWordCount(0);
-    setTotalArticles(0);
-    setWithAudioCount(0);
-    setYoutubeCount(0);
-    setUncoveredWords([]);
-    setSearched(false);
-    setOpenDetails({});
+    setSnap((s) => ({
+      ...s,
+      error: null,
+      articles: [],
+      inputWordCount: 0,
+      totalArticles: 0,
+      withAudioCount: 0,
+      youtubeCount: 0,
+      uncoveredWords: [],
+      searched: false,
+      openDetails: {},
+    }));
     try {
       const res = await fetch("/api/by-article", {
         method: "POST",
@@ -87,18 +124,21 @@ export default function ByArticlePage() {
         error?: string;
       };
       if (!res.ok) {
-        setError(data.error || `请求失败 (${res.status})`);
+        setSnap((s) => ({ ...s, error: data.error || `请求失败 (${res.status})` }));
         return;
       }
-      setArticles(data.articles || []);
-      setInputWordCount(data.inputWordCount ?? 0);
-      setTotalArticles(data.totalArticles ?? 0);
-      setWithAudioCount(data.withAudioCount ?? 0);
-      setYoutubeCount(data.youtubeCount ?? 0);
-      setUncoveredWords(data.uncoveredWords || []);
-      setSearched(true);
+      setSnap((s) => ({
+        ...s,
+        articles: data.articles || [],
+        inputWordCount: data.inputWordCount ?? 0,
+        totalArticles: data.totalArticles ?? 0,
+        withAudioCount: data.withAudioCount ?? 0,
+        youtubeCount: data.youtubeCount ?? 0,
+        uncoveredWords: data.uncoveredWords || [],
+        searched: true,
+      }));
     } catch {
-      setError("网络或服务器错误");
+      setSnap((s) => ({ ...s, error: "网络或服务器错误" }));
     } finally {
       setLoading(false);
     }
@@ -110,6 +150,7 @@ export default function ByArticlePage() {
       <p className="mt-1 text-sm text-zinc-500">
         每行一个泰文词。用<strong>贪心最小覆盖</strong>：反复选择当前能覆盖最多「尚未覆盖」词语的文章；覆盖数相同时优先选已有音频
         🎵。下列顺序即为建议处理顺序。
+        <span className="text-zinc-400"> 切换顶部导航会保留输入与聚合结果。</span>
       </p>
 
       <label className="mt-6 block">
@@ -118,7 +159,7 @@ export default function ByArticlePage() {
         </span>
         <textarea
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => setSnap((s) => ({ ...s, text: e.target.value }))}
           rows={10}
           className="w-full rounded-lg border border-zinc-300 bg-white p-3 font-mono text-sm outline-none ring-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900"
           placeholder={"ทุกข์\nสมาธิ"}
@@ -236,7 +277,7 @@ export default function ByArticlePage() {
             <p className="mt-1 text-xs text-zinc-500">默认折叠，点击标题展开。</p>
             <div className="mt-4 flex flex-col gap-3">
               {articles.map((a, idx) => {
-                const isOpen = Boolean(openDetails[idx]);
+                const isOpen = Boolean(openDetails[String(idx)]);
                 return (
                   <div
                     key={`detail-${idx}-${a.path}`}
@@ -246,12 +287,13 @@ export default function ByArticlePage() {
                     <button
                       type="button"
                       aria-expanded={isOpen}
-                      onClick={() =>
-                        setOpenDetails((d) => ({
-                          ...d,
-                          [idx]: !d[idx],
-                        }))
-                      }
+                      onClick={() => {
+                        const k = String(idx);
+                        setSnap((s) => ({
+                          ...s,
+                          openDetails: { ...s.openDetails, [k]: !s.openDetails[k] },
+                        }));
+                      }}
                       className="flex w-full cursor-pointer flex-wrap items-center gap-2 rounded-xl px-4 py-3 text-left transition hover:bg-zinc-50 dark:hover:bg-zinc-800/80"
                     >
                       <span
