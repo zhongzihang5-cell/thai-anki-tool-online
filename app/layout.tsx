@@ -40,6 +40,9 @@ function Nav() {
           <Link href="/by-article" className={link}>
             按文章聚合
           </Link>
+          <Link href="/words" className={link}>
+            单词管理
+          </Link>
         </nav>
       </div>
     </header>
