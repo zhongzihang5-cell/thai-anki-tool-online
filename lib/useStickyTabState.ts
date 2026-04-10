@@ -7,7 +7,7 @@ export const TAB_PERSIST = {
   search: "thai-anki-persist-search-v1",
   batch: "thai-anki-persist-batch-v1",
   byArticle: "thai-anki-persist-by-article-v1",
-  words: "thai-anki-persist-words-v1",
+  words: "thai-anki-persist-words-v2",
   workspace: "thai-anki-persist-workspace-v1",
 } as const;
 

@@ -9,7 +9,13 @@ import {
   emptyDraft,
   type Next30DraftRow,
 } from "@/lib/ankiCsvExport";
-import { pickNextBatch, thaiWordKey } from "@/lib/pickNext30";
+import {
+  eligibleWorkflowRows,
+  filterExcluded,
+  resolveWorkflowArticleBatch,
+} from "@/lib/pickArticleBatch";
+import { thaiWordKey } from "@/lib/pickNext30";
+import type { ByArticleArticle } from "@/lib/runArticleSearch";
 import type { WordRow, WordsCatalogStats } from "@/lib/runWordsCatalog";
 import {
   isShelvedKey,
@@ -35,6 +41,11 @@ type WordsPersist = {
   next30Drafts: Next30DraftRow[];
   next30Visible: boolean;
   error: string | null;
+  /** 已结束上一批、不参与下次选篇的词（thaiWordKey） */
+  articleConsumedKeys: string[];
+  focusArticle: ByArticleArticle | null;
+  frequencyFallback: boolean;
+  batchArticleTotalInArticle: number;
 };
 
 const WORDS_INITIAL: WordsPersist = {
@@ -45,6 +56,10 @@ const WORDS_INITIAL: WordsPersist = {
   next30Drafts: [],
   next30Visible: false,
   error: null,
+  articleConsumedKeys: [],
+  focusArticle: null,
+  frequencyFallback: false,
+  batchArticleTotalInArticle: 0,
 };
 
 function statusBadgeClass(s: WordRow["status"]): string {
@@ -66,7 +81,15 @@ function statusBadgeClass(s: WordRow["status"]): string {
 
 export default function WordsPage() {
   const [snap, setSnap] = useStickyTabState<WordsPersist>(TAB_PERSIST.words, WORDS_INITIAL);
-  const { filter, stats, next30Visible, error } = snap;
+  const {
+    filter,
+    stats,
+    next30Visible,
+    error,
+    focusArticle,
+    frequencyFallback,
+    batchArticleTotalInArticle,
+  } = snap;
   const words = Array.isArray(snap.words) ? snap.words : [];
   const next30 = Array.isArray(snap.next30) ? snap.next30 : [];
   const next30Drafts =
@@ -74,6 +97,7 @@ export default function WordsPage() {
       ? snap.next30Drafts
       : next30.map(() => emptyDraft());
   const [loading, setLoading] = useState(false);
+  const [articlePickLoading, setArticlePickLoading] = useState(false);
   const [shelved, setShelved] = useState<Set<string>>(new Set());
   const [batchSize, setBatchSize] = useState(30);
 
@@ -101,6 +125,10 @@ export default function WordsPage() {
       next30Visible: false,
       next30: [],
       next30Drafts: [],
+      articleConsumedKeys: [],
+      focusArticle: null,
+      frequencyFallback: false,
+      batchArticleTotalInArticle: 0,
     }));
     try {
       const res = await fetch("/api/words", {
@@ -159,35 +187,87 @@ export default function WordsPage() {
     });
   }
 
-  function handleNextBatch() {
-    setSnap((s) => {
-      const list = Array.isArray(s.words) ? s.words : [];
-      if (list.length === 0) {
-        return {
+  const pickArticleBatch = useCallback(
+    async (consumed: ReadonlySet<string>) => {
+      setArticlePickLoading(true);
+      try {
+        if (words.length === 0) {
+          setSnap((s) => ({
+            ...s,
+            error: "词表为空，请确认数据源设置（设置页）后刷新。",
+          }));
+          return;
+        }
+        const eligible = filterExcluded(
+          eligibleWorkflowRows(words, shelved),
+          consumed
+        );
+        const thaiList = eligible.map((w) => w.thai.trim()).filter(Boolean);
+        let articles: ByArticleArticle[] = [];
+        if (thaiList.length > 0) {
+          const r = await fetch("/api/by-article", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ words: thaiList }),
+          });
+          const d = (await r.json()) as {
+            articles?: ByArticleArticle[];
+            error?: string;
+          };
+          if (!r.ok) {
+            setSnap((s) => ({
+              ...s,
+              error: d.error || `选篇失败 (${r.status})`,
+            }));
+            return;
+          }
+          articles = d.articles ?? [];
+        }
+        const resolved = resolveWorkflowArticleBatch({
+          catalog: words,
+          articles,
+          shelvedKeys: shelved,
+          consumedKeys: consumed,
+          cap: batchSize,
+        });
+        if (!resolved.ok) {
+          setSnap((s) => ({ ...s, error: resolved.error }));
+          return;
+        }
+        setSnap((s) => ({
           ...s,
-          error: "词表为空，请确认数据源设置（设置页）后刷新。",
-        };
+          next30: resolved.batch,
+          next30Drafts: resolved.batch.map(() => emptyDraft()),
+          next30Visible: true,
+          focusArticle: resolved.focusArticle,
+          frequencyFallback: resolved.focusArticle === null,
+          batchArticleTotalInArticle: resolved.totalInArticle,
+          error: null,
+        }));
+      } catch {
+        setSnap((s) => ({ ...s, error: "网络或服务器错误" }));
+      } finally {
+        setArticlePickLoading(false);
       }
-      const prev = Array.isArray(s.next30) ? s.next30 : [];
-      const exclude = new Set(prev.map((w) => thaiWordKey(w.thai)));
-      const picked = pickNextBatch(list, batchSize, exclude, shelved);
-      if (picked.length === 0) {
-        return {
-          ...s,
-          error:
-            exclude.size > 0 || shelved.size > 0
-              ? "没有更多未展示的待录入/需补充词（可能已全部展示、已搁置或已完成队列）。可切换筛选或恢复搁置。"
-              : "词表中没有状态为「待录入」或「需补充例句」的词。",
-        };
-      }
-      return {
-        ...s,
-        next30: picked,
-        next30Drafts: picked.map(() => emptyDraft()),
-        next30Visible: true,
-        error: null,
-      };
-    });
+    },
+    [words, shelved, batchSize, setSnap]
+  );
+
+  function handleStartArticleBatch() {
+    setSnap((s) => ({ ...s, articleConsumedKeys: [], error: null }));
+    void pickArticleBatch(new Set());
+  }
+
+  function handleNextArticleBatch() {
+    if (next30.length === 0) return;
+    const nextConsumed = new Set(snap.articleConsumedKeys);
+    for (const w of next30) nextConsumed.add(thaiWordKey(w.thai));
+    setSnap((s) => ({
+      ...s,
+      articleConsumedKeys: [...nextConsumed],
+      error: null,
+    }));
+    void pickArticleBatch(nextConsumed);
   }
 
   function patchDraft(index: number, patch: Partial<Next30DraftRow>) {
@@ -243,7 +323,7 @@ export default function WordsPage() {
         <Link href="/settings" className="text-teal-700 underline dark:text-teal-400">
           数据源设置
         </Link>{" "}
-        中的路径读取最新 Anki 与 Excel。搁置的词不会进入「待处理」队列；在「搁置」筛选中可查看并恢复。
+        中的路径读取最新 Anki 与 Excel。搁置的词不会进入按文章组批的统计；在「搁置」筛选中可查看并恢复。本页与「工作流」使用同一套按文章选批逻辑。
       </p>
 
       <div className="mt-4 flex flex-wrap gap-3">
@@ -292,28 +372,34 @@ export default function WordsPage() {
 
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
-              本批数量
+              单篇上限
               <input
                 type="number"
                 min={1}
                 max={200}
                 value={batchSize}
                 onChange={(e) => setBatchSize(Number(e.target.value) || 30)}
+                title="同一篇文章里最多取几个词；本篇待处理词超过此数时保留频次最高的 N 个"
                 className="w-16 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-900"
               />
             </label>
             <button
               type="button"
-              onClick={handleNextBatch}
-              disabled={loading}
-              title={
-                words.length === 0
-                  ? "等待词表加载"
-                  : "再次点击会跳过当前列表中已展示的词，取下一批"
-              }
+              onClick={handleStartArticleBatch}
+              disabled={loading || words.length === 0 || articlePickLoading}
+              title="在待录入/需补充中选「当前覆盖待处理词最多」的一篇；只本篇、不跨篇。超过上限按频次截断。"
               className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition enabled:hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:enabled:hover:bg-zinc-800"
             >
-              获取下 N 个待处理
+              {articlePickLoading ? "组批中…" : "按文章获取本批"}
+            </button>
+            <button
+              type="button"
+              onClick={handleNextArticleBatch}
+              disabled={loading || next30.length === 0 || articlePickLoading}
+              title="本篇处理完后，按同样规则选下一篇（已展示过的词不再参与选篇）"
+              className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition enabled:hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:enabled:hover:bg-zinc-800"
+            >
+              下一批
             </button>
             {next30Visible && next30.length > 0 && (
               <>
@@ -344,15 +430,26 @@ export default function WordsPage() {
           {next30Visible && next30.length > 0 && (
             <div className="mt-4 space-y-4">
               <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-                <p className="text-xs font-medium text-zinc-500">
-                  优先「待录入」，再「需补充例句」；同组内按出现频次从高到低。已搁置的词不会入选。再次点击会跳过本页当前列表里已展示的词。共 {next30.length}{" "}
-                  个。也可在{" "}
+                <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                  {focusArticle
+                    ? `今日文章：${focusArticle.fileName}（共 ${next30.length} 个词${
+                        batchArticleTotalInArticle > next30.length
+                          ? `；本篇 ${batchArticleTotalInArticle} 个待处理，已取频次最高 ${next30.length} 个`
+                          : ""
+                      }）`
+                    : frequencyFallback
+                      ? `未绑定单篇文章（共 ${next30.length} 个词，按全库频次）`
+                      : `今日文章：—（共 ${next30.length} 个词）`}
+                </p>
+                <p className="mt-2 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                  规则：在全部待录入/需补充（不含搁置）里统计每篇文章覆盖数，选最多的一篇；本批只含该篇中的词。超过单篇上限时保留频次最高的
+                  N 个。点「下一批」会跳过本批已展示的词，再选下一篇。也可在{" "}
                   <Link href="/workflow" className="text-teal-700 underline dark:text-teal-400">
                     工作流
                   </Link>{" "}
-                  中录入并导出。
+                  边看全文边录入。
                 </p>
-                <p className="mt-2 font-mono text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                <p className="mt-3 font-mono text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
                   {next30.map((w) => w.thai).join("、")}
                 </p>
               </div>

@@ -13,7 +13,13 @@ import {
 import { articleNumberFromArticle } from "@/lib/articleNumber";
 import { extractArticleTitleFromBody } from "@/lib/extractArticleTitle";
 import { highlightThaiWordsInText } from "@/lib/highlightThaiText";
-import { pickNextBatch, thaiWordKey } from "@/lib/pickNext30";
+import {
+  articleForBatchDisplay,
+  eligibleWorkflowRows,
+  filterExcluded,
+  resolveWorkflowArticleBatch,
+} from "@/lib/pickArticleBatch";
+import { thaiWordKey } from "@/lib/pickNext30";
 import type { ByArticleArticle } from "@/lib/runArticleSearch";
 import type { WordRow } from "@/lib/runWordsCatalog";
 import {
@@ -26,13 +32,7 @@ import {
   youtubeLuangporQuery,
 } from "@/lib/thaiArticleDates";
 
-const WF_LS = "thai-anki-workflow-batch-v2";
-
-function articleCoversThai(a: ByArticleArticle, thai: string): boolean {
-  const k = thaiWordKey(thai);
-  if (!k) return false;
-  return a.words.some((hit) => thaiWordKey(hit.word) === k);
-}
+const WF_LS = "thai-anki-workflow-batch-v3";
 
 function isWordDraftComplete(w: WordRow, d: Next30DraftRow): boolean {
   const req = Math.min(3, Math.max(1, w.requiredExamples));
@@ -93,16 +93,21 @@ export default function WorkflowPage() {
   const [batchSize, setBatchSize] = useState(30);
   const [shelved, setShelved] = useState<Set<string>>(loadShelvedKeys);
 
-  const [articles, setArticles] = useState<ByArticleArticle[] | null>(null);
-  const [coverLoading, setCoverLoading] = useState(false);
+  /** 贪心首篇全文；频次回退时为 null */
+  const [focusArticle, setFocusArticle] = useState<ByArticleArticle | null>(null);
+  /** 已结束上一批、不再参与「选篇」的词（仅按文章组批时使用） */
+  const [articleConsumedKeys, setArticleConsumedKeys] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [frequencyFallback, setFrequencyFallback] = useState(false);
+  const [articlePickLoading, setArticlePickLoading] = useState(false);
+  const [batchArticleStats, setBatchArticleStats] = useState({
+    totalInArticle: 0,
+  });
 
   const [expandedPath, setExpandedPath] = useState<string | null>(null);
   const [bodyCache, setBodyCache] = useState<Record<string, string>>({});
   const [bodyLoading, setBodyLoading] = useState<string | null>(null);
-  /** 不含当前选中词的文章，用户点击「展开」后显示完整卡片 */
-  const [expandedOtherArticles, setExpandedOtherArticles] = useState<Set<string>>(
-    () => new Set()
-  );
 
   const fetchCatalog = useCallback(async () => {
     setCatLoading(true);
@@ -140,6 +145,9 @@ export default function WorkflowPage() {
         batch?: WordRow[];
         drafts?: Next30DraftRow[];
         sel?: number;
+        focusArticle?: ByArticleArticle | null;
+        articleConsumedKeys?: string[];
+        frequencyFallback?: boolean;
       };
       if (Array.isArray(p.batch) && p.batch.length > 0) {
         setBatch(p.batch);
@@ -149,6 +157,17 @@ export default function WorkflowPage() {
             : p.batch.map(() => emptyDraft())
         );
         setSel(typeof p.sel === "number" ? p.sel : 0);
+        setFocusArticle(
+          p.focusArticle && typeof p.focusArticle === "object" ? p.focusArticle : null
+        );
+        setArticleConsumedKeys(
+          new Set(
+            Array.isArray(p.articleConsumedKeys)
+              ? p.articleConsumedKeys.filter((k) => typeof k === "string")
+              : []
+          )
+        );
+        setFrequencyFallback(p.frequencyFallback === true);
       }
     } catch {
       /* ignore */
@@ -160,12 +179,19 @@ export default function WorkflowPage() {
     try {
       localStorage.setItem(
         WF_LS,
-        JSON.stringify({ batch, drafts, sel })
+        JSON.stringify({
+          batch,
+          drafts,
+          sel,
+          focusArticle,
+          articleConsumedKeys: [...articleConsumedKeys],
+          frequencyFallback,
+        })
       );
     } catch {
       /* quota */
     }
-  }, [batch, drafts, sel]);
+  }, [batch, drafts, sel, focusArticle, articleConsumedKeys, frequencyFallback]);
 
   useEffect(() => {
     saveShelvedKeys(shelved);
@@ -178,22 +204,40 @@ export default function WorkflowPage() {
   }, [batch.length, sel]);
 
   useEffect(() => {
-    setExpandedOtherArticles(new Set());
-  }, [sel]);
+    if (batch.length === 0) {
+      setFocusArticle(null);
+      setFrequencyFallback(false);
+      setBatchArticleStats({ totalInArticle: 0 });
+    }
+  }, [batch.length]);
 
   const batchThaiKeys = useMemo(
     () => batch.map((w) => w.thai.trim()).filter(Boolean),
     [batch]
   );
 
+  const displayArticle = useMemo(
+    () =>
+      focusArticle && batch.length > 0
+        ? articleForBatchDisplay(focusArticle, batch)
+        : null,
+    [focusArticle, batch]
+  );
+
+  /** 旧版持久化无 focusArticle 时，用当前批次词补拉一篇以便中栏可用 */
+  const [legacyArticleHydrated, setLegacyArticleHydrated] = useState(false);
   useEffect(() => {
-    if (batch.length === 0) {
-      setArticles(null);
+    if (
+      batch.length === 0 ||
+      focusArticle !== null ||
+      frequencyFallback ||
+      legacyArticleHydrated
+    ) {
       return;
     }
     const words = batch.map((w) => w.thai.trim()).filter(Boolean);
+    if (words.length === 0) return;
     let cancelled = false;
-    setCoverLoading(true);
     fetch("/api/by-article", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -201,18 +245,34 @@ export default function WorkflowPage() {
     })
       .then((r) => r.json())
       .then((d: { articles?: ByArticleArticle[] }) => {
-        if (!cancelled) setArticles(d.articles ?? []);
+        if (cancelled) return;
+        const first = d.articles?.[0];
+        if (first) setFocusArticle(first);
       })
       .catch(() => {
-        if (!cancelled) setArticles([]);
+        /* ignore */
       })
       .finally(() => {
-        if (!cancelled) setCoverLoading(false);
+        if (!cancelled) setLegacyArticleHydrated(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [batch]);
+  }, [batch, focusArticle, frequencyFallback, legacyArticleHydrated]);
+
+  const batchKey = useMemo(
+    () => batch.map((w) => thaiWordKey(w.thai)).join("\0"),
+    [batch]
+  );
+
+  useEffect(() => {
+    const p = displayArticle?.path ?? focusArticle?.path;
+    if (!p) {
+      setExpandedPath(null);
+      return;
+    }
+    setExpandedPath(p);
+  }, [batchKey, displayArticle?.path, focusArticle?.path]);
 
   useEffect(() => {
     if (!expandedPath || bodyCache[expandedPath]) return;
@@ -237,22 +297,73 @@ export default function WorkflowPage() {
     };
   }, [expandedPath, bodyCache]);
 
-  function startBatch() {
-    const picked = pickNextBatch(catalog, batchSize, new Set(), shelved);
-    if (picked.length === 0) {
-      setCatError(
-        shelved.size > 0
-          ? "没有可取的待录入/需补充词（已全部搁置或已完成队列）。可在单词管理恢复搁置或调整批次大小。"
-          : "词表中没有待录入或需补充的词。"
-      );
-      return;
-    }
-    setCatError(null);
-    setBatch(picked);
-    setDrafts(picked.map(() => emptyDraft()));
-    setSel(0);
-    setExpandedPath(null);
-  }
+  const pickWorkflowBatch = useCallback(
+    async (consumed: ReadonlySet<string>) => {
+      setArticlePickLoading(true);
+      setCatError(null);
+      try {
+        const eligible = filterExcluded(
+          eligibleWorkflowRows(catalog, shelved),
+          consumed
+        );
+        const words = eligible.map((w) => w.thai.trim()).filter(Boolean);
+        let articles: ByArticleArticle[] = [];
+        if (words.length > 0) {
+          const r = await fetch("/api/by-article", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ words }),
+          });
+          const d = (await r.json()) as {
+            articles?: ByArticleArticle[];
+            error?: string;
+          };
+          if (!r.ok) {
+            setCatError(d.error || `选篇失败 ${r.status}`);
+            return;
+          }
+          articles = d.articles ?? [];
+        }
+
+        const resolved = resolveWorkflowArticleBatch({
+          catalog,
+          articles,
+          shelvedKeys: shelved,
+          consumedKeys: consumed,
+          cap: batchSize,
+        });
+        if (!resolved.ok) {
+          setCatError(resolved.error);
+          return;
+        }
+        setBatch(resolved.batch);
+        setDrafts(resolved.batch.map(() => emptyDraft()));
+        setSel(0);
+        setFocusArticle(resolved.focusArticle);
+        setFrequencyFallback(resolved.focusArticle === null);
+        setBatchArticleStats({ totalInArticle: resolved.totalInArticle });
+        setLegacyArticleHydrated(true);
+      } catch {
+        setCatError("网络错误");
+      } finally {
+        setArticlePickLoading(false);
+      }
+    },
+    [catalog, shelved, batchSize]
+  );
+
+  const startBatch = useCallback(() => {
+    setArticleConsumedKeys(new Set());
+    void pickWorkflowBatch(new Set());
+  }, [pickWorkflowBatch]);
+
+  const nextArticleBatch = useCallback(() => {
+    if (batch.length === 0) return;
+    const nextConsumed = new Set(articleConsumedKeys);
+    for (const w of batch) nextConsumed.add(thaiWordKey(w.thai));
+    setArticleConsumedKeys(nextConsumed);
+    void pickWorkflowBatch(nextConsumed);
+  }, [batch, articleConsumedKeys, pickWorkflowBatch]);
 
   function shelveCurrent() {
     const idx = sel;
@@ -280,39 +391,6 @@ export default function WorkflowPage() {
   const current = batch[sel] ?? null;
   const selectedThai = current?.thai.trim() ?? "";
   const selectedThaiKey = selectedThai ? thaiWordKey(selectedThai) : "";
-
-  const sortedArticles = useMemo(() => {
-    if (!articles?.length) return [];
-    if (!selectedThai) return articles;
-    return [...articles].sort((a, b) => {
-      const ha = articleCoversThai(a, selectedThai);
-      const hb = articleCoversThai(b, selectedThai);
-      if (ha === hb) return 0;
-      return ha ? -1 : 1;
-    });
-  }, [articles, selectedThai]);
-
-  const wordArticleNumsLabel = useMemo(() => {
-    if (!articles?.length || batch.length === 0) return new Map<string, string>();
-    const map = new Map<string, string>();
-    for (const w of batch) {
-      const key = thaiWordKey(w.thai);
-      const nums: string[] = [];
-      for (const a of articles) {
-        if (articleCoversThai(a, w.thai)) {
-          nums.push(articleNumberFromArticle(a));
-        }
-      }
-      nums.sort((x, y) => {
-        const nx = parseInt(x, 10);
-        const ny = parseInt(y, 10);
-        if (!Number.isNaN(nx) && !Number.isNaN(ny)) return nx - ny;
-        return x.localeCompare(y);
-      });
-      map.set(key, nums.length ? nums.join(" ") : "—");
-    }
-    return map;
-  }, [articles, batch]);
 
   const d = drafts[sel] ?? emptyDraft();
   const doneCount = countCompletedDrafts(batch, drafts);
@@ -361,10 +439,18 @@ export default function WorkflowPage() {
             <button
               type="button"
               onClick={startBatch}
-              disabled={catLoading || catalog.length === 0}
+              disabled={catLoading || catalog.length === 0 || articlePickLoading}
               className="rounded-md bg-zinc-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
             >
-              获取下 N 个待处理
+              {articlePickLoading ? "组批中…" : "获取下 N 个待处理"}
+            </button>
+            <button
+              type="button"
+              onClick={nextArticleBatch}
+              disabled={batch.length === 0 || articlePickLoading}
+              className="rounded-md border border-zinc-300 px-3 py-1 text-xs font-medium dark:border-zinc-600"
+            >
+              下一批
             </button>
           </div>
         </div>
@@ -377,8 +463,20 @@ export default function WorkflowPage() {
         {/* 左 20% */}
         <aside className="flex w-full shrink-0 flex-col border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900 lg:w-[20%] lg:border-r">
           <div className="border-b border-zinc-100 px-2 py-2 dark:border-zinc-800">
-            <p className="text-xs font-medium text-zinc-500">今日批次</p>
-            <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+            <p className="text-xs font-medium leading-snug text-zinc-700 dark:text-zinc-200">
+              {batch.length === 0
+                ? "今日文章：—"
+                : focusArticle
+                  ? `今日文章：${focusArticle.fileName}（共 ${batch.length} 个词${
+                      batchArticleStats.totalInArticle > batch.length
+                        ? `；本篇 ${batchArticleStats.totalInArticle} 个待处理，已取频次最高 ${batch.length} 个`
+                        : ""
+                    }）`
+                  : frequencyFallback
+                    ? `今日文章：—（共 ${batch.length} 个词，按频次）`
+                    : `今日文章：—（共 ${batch.length} 个词）`}
+            </p>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
               已完成{" "}
               <strong className="text-teal-700 dark:text-teal-400">{doneCount}</strong>/
               {batch.length || "0"}
@@ -388,8 +486,6 @@ export default function WorkflowPage() {
             {batch.map((w, i) => {
               const dr = drafts[i] ?? emptyDraft();
               const done = isWordDraftComplete(w, dr);
-              const artLabel =
-                wordArticleNumsLabel.get(thaiWordKey(w.thai)) ?? "—";
               return (
                 <li key={`${w.thai}-${i}`}>
                   <button
@@ -411,9 +507,6 @@ export default function WorkflowPage() {
                         {done ? "已完成" : "待处理"}
                       </span>
                     </div>
-                    <p className="mt-1 font-mono text-[10px] leading-snug tracking-wide text-zinc-500 dark:text-zinc-400">
-                      {artLabel}
-                    </p>
                   </button>
                 </li>
               );
@@ -427,21 +520,26 @@ export default function WorkflowPage() {
         {/* 中 40% */}
         <section className="flex min-h-[40vh] w-full min-h-0 flex-col border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900 lg:w-[40%] lg:border-r">
           <div className="shrink-0 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
-            <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">文章聚合</h2>
-            {selectedThai ? (
-              <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-                绿色边框：含当前词「{selectedThai}」；其余已折叠，可点「展开」。
-              </p>
-            ) : null}
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">今日文章</h2>
+            <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+              仅展示本篇；正文与词标签中高亮为今日批次全部词
+              {selectedThai ? `；当前编辑「${selectedThai}」` : ""}。
+            </p>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-            {coverLoading ? (
-              <p className="text-xs text-zinc-500">加载覆盖计划…</p>
-            ) : !sortedArticles.length ? (
-              <p className="text-xs text-zinc-500">暂无文章（先选择一批词）</p>
+            {articlePickLoading && batch.length === 0 ? (
+              <p className="text-xs text-zinc-500">正在按文章选批…</p>
+            ) : batch.length === 0 ? (
+              <p className="text-xs text-zinc-500">暂无文章（先获取一批待处理词）</p>
+            ) : !displayArticle ? (
+              <p className="text-xs text-zinc-500">
+                {frequencyFallback
+                  ? "当前批次未绑定单篇文章（词库中未能组出贪心首篇，已按全库频次取词）。仍可照常录入与导出。"
+                  : "正在补全文章信息…"}
+              </p>
             ) : (
               <ul className="space-y-3 pr-1">
-                {sortedArticles.map((a, idx) => {
+                {[displayArticle].map((a) => {
                   const phrase = a.youtubeSearchDatePhrase?.trim();
                   const open = expandedPath === a.path;
                   const body = bodyCache[a.path];
@@ -450,122 +548,84 @@ export default function WorkflowPage() {
                       ? extractArticleTitleFromBody(body, a.fileName)
                       : a.fileName;
                   const wordsInArticle = a.words.map((x) => x.word);
-                  const hasSelected =
-                    !!selectedThai && articleCoversThai(a, selectedThai);
-                  const showOtherFull =
-                    hasSelected || !selectedThai || expandedOtherArticles.has(a.path);
                   const artNo = articleNumberFromArticle(a);
-                  const dimIrrelevant = !!selectedThai && !hasSelected;
                   return (
                     <li
-                      key={`${a.path}-${idx}`}
-                      className={`rounded-lg border p-3 transition dark:border-zinc-800 ${
-                        hasSelected && selectedThai
-                          ? "border-emerald-500 bg-emerald-50/80 ring-2 ring-emerald-500/60 dark:border-emerald-600 dark:bg-emerald-950/35 dark:ring-emerald-600/50"
-                          : "border-zinc-200 dark:border-zinc-700"
-                      } ${!showOtherFull ? "max-h-[5.25rem] overflow-hidden" : ""}`}
+                      key={a.path}
+                      className="rounded-lg border border-zinc-200 p-3 transition dark:border-zinc-700"
                     >
                       <div className="flex flex-wrap items-start justify-between gap-2">
                         <button
                           type="button"
                           onClick={() => setExpandedPath(open ? null : a.path)}
-                          className={`text-left text-sm font-medium underline ${
-                            hasSelected && selectedThai
-                              ? "text-emerald-900 dark:text-emerald-200"
-                              : "text-teal-800 dark:text-teal-300"
-                          } ${dimIrrelevant ? "opacity-45" : ""}`}
+                          className="text-left text-sm font-medium text-teal-800 underline dark:text-teal-300"
                         >
                           <span className="mr-1.5 font-mono text-[11px] font-normal text-zinc-500 no-underline dark:text-zinc-400">
                             {artNo}
                           </span>
                           {title}
                         </button>
-                        {!hasSelected && selectedThai && !showOtherFull ? (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setExpandedOtherArticles((prev) => {
-                                const next = new Set(prev);
-                                next.add(a.path);
-                                return next;
-                              });
-                            }}
-                            className="shrink-0 rounded border border-zinc-400 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-800 shadow-sm dark:border-zinc-500 dark:bg-zinc-800 dark:text-zinc-100"
-                          >
-                            展开
-                          </button>
-                        ) : null}
                       </div>
-                      {showOtherFull ? (
-                        <div className={dimIrrelevant ? "opacity-45" : ""}>
-                          <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-zinc-600 dark:text-zinc-400">
-                            {phrase ? (
-                              <>
-                                <span>佛历：{buddhistDisplay(phrase)}</span>
-                                <span>{gregorianDisplay(phrase)}</span>
-                              </>
-                            ) : (
-                              <span>日期：—</span>
-                            )}
-                          </div>
-                          <div className="mt-2 flex flex-wrap gap-1">
-                            {wordsInArticle.map((tw) => {
-                              const isSel =
-                                !!selectedThaiKey &&
-                                thaiWordKey(tw) === selectedThaiKey;
-                              return (
-                                <span
-                                  key={tw}
-                                  className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
-                                    isSel
-                                      ? "bg-amber-200 font-medium text-amber-950 ring-1 ring-amber-400/80 dark:bg-amber-500/35 dark:text-amber-50 dark:ring-amber-400/50"
-                                      : "bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200"
-                                  }`}
-                                >
-                                  {tw}
-                                </span>
-                              );
-                            })}
-                          </div>
-                          <div className="mt-2 flex flex-wrap items-center gap-2">
-                            <span className="text-lg">{a.audioIcon}</span>
-                            <span className="text-xs text-zinc-500">
-                              {a.hasAudio ? "已有音频" : "需找 YouTube"}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                const q = youtubeLuangporQuery(phrase);
-                                try {
-                                  await navigator.clipboard.writeText(q);
-                                } catch {
-                                  alert("复制失败");
-                                }
-                              }}
-                              className="rounded border border-zinc-300 px-2 py-0.5 text-[11px] dark:border-zinc-600"
+                      <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-zinc-600 dark:text-zinc-400">
+                        {phrase ? (
+                          <>
+                            <span>佛历：{buddhistDisplay(phrase)}</span>
+                            <span>{gregorianDisplay(phrase)}</span>
+                          </>
+                        ) : (
+                          <span>日期：—</span>
+                        )}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {wordsInArticle.map((tw) => {
+                          const isCurrent =
+                            !!selectedThaiKey && thaiWordKey(tw) === selectedThaiKey;
+                          return (
+                            <span
+                              key={tw}
+                              className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
+                                isCurrent
+                                  ? "bg-amber-200 font-medium text-amber-950 ring-1 ring-amber-400/80 dark:bg-amber-500/35 dark:text-amber-50 dark:ring-amber-400/50"
+                                  : "bg-amber-100/80 text-amber-950 dark:bg-amber-900/30 dark:text-amber-100"
+                              }`}
                             >
-                              复制 YouTube 搜索词
-                            </button>
-                          </div>
-                          {open && (
-                            <div className="mt-3 max-h-80 overflow-y-auto rounded border border-zinc-100 bg-zinc-50 p-2 text-xs leading-relaxed dark:border-zinc-800 dark:bg-zinc-950/50">
-                              {bodyLoading === a.path && !body ? (
-                                <p className="text-zinc-500">加载全文…</p>
-                              ) : body ? (
-                                <div className="whitespace-pre-wrap break-words text-zinc-800 dark:text-zinc-200">
-                                  {highlightThaiWordsInText(body, batchThaiKeys)}
-                                </div>
-                              ) : (
-                                <p className="text-zinc-500">无法加载正文</p>
-                              )}
+                              {tw}
+                            </span>
+                          );
+                        })}
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <span className="text-lg">{a.audioIcon}</span>
+                        <span className="text-xs text-zinc-500">
+                          {a.hasAudio ? "已有音频" : "需找 YouTube"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const q = youtubeLuangporQuery(phrase);
+                            try {
+                              await navigator.clipboard.writeText(q);
+                            } catch {
+                              alert("复制失败");
+                            }
+                          }}
+                          className="rounded border border-zinc-300 px-2 py-0.5 text-[11px] dark:border-zinc-600"
+                        >
+                          复制 YouTube 搜索词
+                        </button>
+                      </div>
+                      {open && (
+                        <div className="mt-3 max-h-80 overflow-y-auto rounded border border-zinc-100 bg-zinc-50 p-2 text-xs leading-relaxed dark:border-zinc-800 dark:bg-zinc-950/50">
+                          {bodyLoading === a.path && !body ? (
+                            <p className="text-zinc-500">加载全文…</p>
+                          ) : body ? (
+                            <div className="whitespace-pre-wrap break-words text-zinc-800 dark:text-zinc-200">
+                              {highlightThaiWordsInText(body, batchThaiKeys)}
                             </div>
+                          ) : (
+                            <p className="text-zinc-500">无法加载正文</p>
                           )}
                         </div>
-                      ) : (
-                        <p className="mt-1 text-[10px] text-zinc-500 opacity-50 dark:text-zinc-500">
-                          此文不含当前选中词
-                        </p>
                       )}
                     </li>
                   );
