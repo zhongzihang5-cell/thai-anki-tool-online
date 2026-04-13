@@ -52,6 +52,9 @@ function Nav() {
           <Link href="/by-article" className={secondary}>
             按文章
           </Link>
+          <Link href="/article-number" className={secondary}>
+            编号查词
+          </Link>
           <Link href="/workspace" className={secondary}>
             工作台
           </Link>

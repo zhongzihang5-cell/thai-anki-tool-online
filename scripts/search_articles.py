@@ -4,7 +4,9 @@ Search Thai article folders for example sentences containing a target word.
 Normalization: whitespace removed before substring match.
 Reads JSON from stdin:
   {"mode":"single","query":"..."} | {"mode":"batch","words":["..."]} | {"mode":"by_article","words":["..."]}
+  | {"mode":"words_in_article_number","articleNumber":"003","words":["..."],"source":"all"|"official"|"wechat"}
 by_article: greedy minimum cover (max new words per step; tie → hasAudio), plus counts & uncoveredWords.
+words_in_article_number: 按文件名开头的数字匹配文章（3 / 03 / 003 等价），在指定篇内检测哪些词出现；source 限定官网/公众号。
 Writes JSON to stdout. Config path is argv[1].
 """
 
@@ -376,6 +378,149 @@ def greedy_cover_plan(
     return plan, uncovered_list
 
 
+def _normalize_article_source_scope(raw: Any) -> str:
+    if raw in ("official", "wechat", "all"):
+        return str(raw)
+    return "all"
+
+
+def list_paths_for_article_number(
+    article_number: str, cfg: dict[str, Any], source_scope: str = "all"
+) -> list[tuple[Path, str]]:
+    u = (article_number or "").strip()
+    u_digits = re.sub(r"[^\d]", "", u)
+    if not u_digits:
+        return []
+    try:
+        target_num = int(u_digits)
+    except ValueError:
+        return []
+    dhamma = Path(cfg["dhammaArticlesDir"])
+    wechat = Path(cfg["wechatArticlesDir"])
+    out: list[tuple[Path, str]] = []
+    for root, kind in ((dhamma, "official"), (wechat, "wechat")):
+        if source_scope == "official" and kind != "official":
+            continue
+        if source_scope == "wechat" and kind != "wechat":
+            continue
+        if not root.is_dir():
+            continue
+        for path in collect_text_files(root):
+            stem = path.stem
+            m = re.match(r"^(\d+)", stem)
+            if not m:
+                continue
+            try:
+                if int(m.group(1)) != target_num:
+                    continue
+            except ValueError:
+                continue
+            out.append((path, kind))
+    out.sort(key=lambda x: (x[1], str(x[0])))
+    return out
+
+
+def file_article_preview(path: Path, kind: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    official_to_wechat = {str(k): str(v) for k, v in (cfg.get("officialToWechat") or {}).items()}
+    audio_ids = {str(int(x)) for x in (cfg.get("wechatAudioIds") or [])}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    basename = path.stem
+    has_audio = source_has_audio(
+        kind=kind,
+        basename=basename,
+        official_to_wechat=official_to_wechat,
+        audio_ids=audio_ids,
+    )
+    label = f"{'官网' if kind == 'official' else '公众号'} · {path.name}"
+    rec: dict[str, Any] = {
+        "path": str(path.resolve()),
+        "fileName": path.name,
+        "sourceLabel": label,
+        "kind": kind,
+        "hasAudio": has_audio,
+        "audioIcon": "🎵" if has_audio else "📺",
+    }
+    if kind == "official":
+        dt = extract_official_youtube_date_phrase(raw)
+        if dt:
+            rec["youtubeSearchDatePhrase"] = dt
+    return rec
+
+
+def words_in_article_number(
+    article_number: str,
+    words: list[str],
+    cfg: dict[str, Any],
+    source_scope: str = "all",
+) -> dict[str, Any]:
+    paths_kinds = list_paths_for_article_number(article_number, cfg, source_scope)
+    ordered = unique_ordered_words(words)
+    scope_hint = {
+        "all": "（官网与公众号目录）",
+        "official": "（仅限官网目录）",
+        "wechat": "（仅限公众号目录）",
+    }.get(source_scope, "")
+    if not paths_kinds:
+        return {
+            "error": f"未找到编号为「{article_number}」的文章{scope_hint}（文件名需以该数字开头，如 003_….txt）",
+            "articleNumber": re.sub(r"[^\d]", "", (article_number or "").strip()) or (article_number or "").strip(),
+            "sourceScope": source_scope,
+            "articleFiles": [],
+            "hits": [],
+            "misses": ordered,
+        }
+    official_to_wechat = {str(k): str(v) for k, v in (cfg.get("officialToWechat") or {}).items()}
+    audio_ids = {str(int(x)) for x in (cfg.get("wechatAudioIds") or [])}
+
+    article_files = [file_article_preview(p, k, cfg) for p, k in paths_kinds]
+
+    hits: list[dict[str, Any]] = []
+    misses: list[str] = []
+    max_sents = MAX_PER_SOURCE * max(1, len(paths_kinds))
+    for w in ordered:
+        norm_w = normalize(w)
+        if not norm_w:
+            continue
+        all_sents: list[str] = []
+        seen_norm_sent: set[str] = set()
+        has_zh = False
+        for path, kind in paths_kinds:
+            m = find_matches_in_file(
+                path,
+                norm_w,
+                kind=kind,
+                official_to_wechat=official_to_wechat,
+                audio_ids=audio_ids,
+            )
+            if m:
+                has_zh = has_zh or bool(m.get("hasChinese"))
+                for s in m["sentences"]:
+                    sn = normalize(s)
+                    if sn not in seen_norm_sent:
+                        seen_norm_sent.add(sn)
+                        all_sents.append(s)
+                    if len(all_sents) >= max_sents:
+                        break
+            if len(all_sents) >= max_sents:
+                break
+        if all_sents:
+            hits.append({"word": w, "sentences": all_sents, "hasChinese": has_zh})
+        else:
+            misses.append(w)
+
+    u_digits = re.sub(r"[^\d]", "", (article_number or "").strip())
+    return {
+        "articleNumber": u_digits or (article_number or "").strip(),
+        "sourceScope": source_scope,
+        "articleFiles": article_files,
+        "hits": hits,
+        "misses": misses,
+    }
+
+
 def aggregate_by_article(words: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     ordered = unique_ordered_words(words)
     if not ordered:
@@ -457,6 +602,24 @@ def main() -> None:
             if isinstance(w, str) and w.strip():
                 cleaned.append(w)
         out = aggregate_by_article(cleaned, cfg)
+    elif mode == "words_in_article_number":
+        article_number = str(payload.get("articleNumber") or "").strip()
+        words = payload.get("words") or []
+        if not isinstance(words, list):
+            words = []
+        cleaned = [w for w in words if isinstance(w, str) and w.strip()]
+        if not article_number:
+            out = {
+                "error": "缺少 articleNumber",
+                "articleNumber": "",
+                "sourceScope": _normalize_article_source_scope(payload.get("source")),
+                "articleFiles": [],
+                "hits": [],
+                "misses": unique_ordered_words(cleaned),
+            }
+        else:
+            scope = _normalize_article_source_scope(payload.get("source"))
+            out = words_in_article_number(article_number, cleaned, cfg, scope)
     else:
         print(json.dumps({"error": "invalid mode"}, ensure_ascii=False), file=sys.stderr)
         sys.exit(2)

@@ -63,10 +63,44 @@ export type ByArticleResponse = {
   uncoveredWords: string[];
 };
 
+export type WordsInArticleNumberHit = {
+  word: string;
+  sentences: string[];
+  hasChinese: boolean;
+};
+
+export type WordsInArticleNumberFile = {
+  path: string;
+  fileName: string;
+  sourceLabel: string;
+  kind: string;
+  hasAudio: boolean;
+  audioIcon: string;
+  youtubeSearchDatePhrase?: string;
+};
+
+export type WordsInArticleNumberSourceScope = "all" | "official" | "wechat";
+
+export type WordsInArticleNumberResponse = {
+  error?: string;
+  articleNumber: string;
+  /** 检索时限定目录：官网 / 公众号 / 全部 */
+  sourceScope?: WordsInArticleNumberSourceScope;
+  articleFiles: WordsInArticleNumberFile[];
+  hits: WordsInArticleNumberHit[];
+  misses: string[];
+};
+
 export type SearchPayload =
   | { mode: "single"; query: string }
   | { mode: "batch"; words: string[] }
-  | { mode: "by_article"; words: string[] };
+  | { mode: "by_article"; words: string[] }
+  | {
+      mode: "words_in_article_number";
+      articleNumber: string;
+      words: string[];
+      source?: WordsInArticleNumberSourceScope;
+    };
 
 function defaultConfigPath(): string {
   return path.join(process.cwd(), "article-config.json");
@@ -75,7 +109,12 @@ function defaultConfigPath(): string {
 export function runArticleSearch(
   payload: SearchPayload,
   configPath: string = defaultConfigPath()
-): Promise<SingleSearchResponse | BatchSearchResponse | ByArticleResponse> {
+): Promise<
+    | SingleSearchResponse
+    | BatchSearchResponse
+    | ByArticleResponse
+    | WordsInArticleNumberResponse
+  > {
   return new Promise((resolve, reject) => {
     const py = spawn("python3", [SCRIPT, configPath], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -99,7 +138,11 @@ export function runArticleSearch(
       }
       try {
         resolve(
-          JSON.parse(outText) as SingleSearchResponse | BatchSearchResponse | ByArticleResponse
+          JSON.parse(outText) as
+            | SingleSearchResponse
+            | BatchSearchResponse
+            | ByArticleResponse
+            | WordsInArticleNumberResponse
         );
       } catch {
         reject(new Error("Invalid JSON from search script"));
