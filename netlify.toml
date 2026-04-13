@@ -1,0 +1,11 @@
+# Next.js on Netlify：必须用 .next 作为 publish，并由插件/OpenNext 接管路由。
+# 若 Dashboard 里曾设为 out、dist 或留空，请改回与本文件一致，或删除 Dashboard 覆盖项以免冲突。
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
