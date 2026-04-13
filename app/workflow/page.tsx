@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Link from "next/link";
 
 import {
@@ -31,6 +38,10 @@ import {
   gregorianDisplay,
   youtubeLuangporQuery,
 } from "@/lib/thaiArticleDates";
+import {
+  clearAllByArticleSessionCache,
+  fetchByArticleWithSessionCache,
+} from "@/lib/byArticleSessionCache";
 
 const WF_LS = "thai-anki-workflow-batch-v3";
 
@@ -124,7 +135,11 @@ export default function WorkflowPage() {
         setCatalog([]);
         return;
       }
-      setCatalog(Array.isArray(j.words) ? j.words : []);
+      const list = Array.isArray(j.words) ? j.words : [];
+      setCatalog(list);
+      if (list.length > 0) {
+        clearAllByArticleSessionCache();
+      }
     } catch {
       setCatError("网络错误");
       setCatalog([]);
@@ -137,7 +152,8 @@ export default function WorkflowPage() {
     void fetchCatalog();
   }, [fetchCatalog]);
 
-  useEffect(() => {
+  /** 在首帧绘制前从 localStorage 恢复，避免闪空白且避免与「batch 为空则清空」的 effect 竞态 */
+  useLayoutEffect(() => {
     try {
       const raw = localStorage.getItem(WF_LS);
       if (!raw) return;
@@ -148,6 +164,7 @@ export default function WorkflowPage() {
         focusArticle?: ByArticleArticle | null;
         articleConsumedKeys?: string[];
         frequencyFallback?: boolean;
+        batchArticleTotalInArticle?: number;
       };
       if (Array.isArray(p.batch) && p.batch.length > 0) {
         setBatch(p.batch);
@@ -168,6 +185,9 @@ export default function WorkflowPage() {
           )
         );
         setFrequencyFallback(p.frequencyFallback === true);
+        if (typeof p.batchArticleTotalInArticle === "number") {
+          setBatchArticleStats({ totalInArticle: p.batchArticleTotalInArticle });
+        }
       }
     } catch {
       /* ignore */
@@ -186,12 +206,21 @@ export default function WorkflowPage() {
           focusArticle,
           articleConsumedKeys: [...articleConsumedKeys],
           frequencyFallback,
+          batchArticleTotalInArticle: batchArticleStats.totalInArticle,
         })
       );
     } catch {
       /* quota */
     }
-  }, [batch, drafts, sel, focusArticle, articleConsumedKeys, frequencyFallback]);
+  }, [
+    batch,
+    drafts,
+    sel,
+    focusArticle,
+    articleConsumedKeys,
+    frequencyFallback,
+    batchArticleStats.totalInArticle,
+  ]);
 
   useEffect(() => {
     saveShelvedKeys(shelved);
@@ -203,8 +232,17 @@ export default function WorkflowPage() {
     }
   }, [batch.length, sel]);
 
+  /**
+   * 勿在首屏 batch 仍为 [] 时清空 focus（会与 localStorage 恢复的 effect 竞态，导致切 tab 丢状态）。
+   * 仅在「本批从有变无」时重置文章元数据。
+   */
+  const prevBatchLenRef = useRef<number | null>(null);
   useEffect(() => {
-    if (batch.length === 0) {
+    const len = batch.length;
+    const prev = prevBatchLenRef.current;
+    prevBatchLenRef.current = len;
+    if (len !== 0) return;
+    if (prev !== null && prev > 0) {
       setFocusArticle(null);
       setFrequencyFallback(false);
       setBatchArticleStats({ totalInArticle: 0 });
@@ -238,15 +276,10 @@ export default function WorkflowPage() {
     const words = batch.map((w) => w.thai.trim()).filter(Boolean);
     if (words.length === 0) return;
     let cancelled = false;
-    fetch("/api/by-article", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ words }),
-    })
-      .then((r) => r.json())
-      .then((d: { articles?: ByArticleArticle[] }) => {
-        if (cancelled) return;
-        const first = d.articles?.[0];
+    void fetchByArticleWithSessionCache(words)
+      .then((res) => {
+        if (cancelled || !res.ok) return;
+        const first = res.articles[0];
         if (first) setFocusArticle(first);
       })
       .catch(() => {
@@ -309,20 +342,12 @@ export default function WorkflowPage() {
         const words = eligible.map((w) => w.thai.trim()).filter(Boolean);
         let articles: ByArticleArticle[] = [];
         if (words.length > 0) {
-          const r = await fetch("/api/by-article", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ words }),
-          });
-          const d = (await r.json()) as {
-            articles?: ByArticleArticle[];
-            error?: string;
-          };
-          if (!r.ok) {
-            setCatError(d.error || `选篇失败 ${r.status}`);
+          const res = await fetchByArticleWithSessionCache(words);
+          if (!res.ok) {
+            setCatError(res.error);
             return;
           }
-          articles = d.articles ?? [];
+          articles = res.articles;
         }
 
         const resolved = resolveWorkflowArticleBatch({

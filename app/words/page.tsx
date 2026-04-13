@@ -10,6 +10,10 @@ import {
   type Next30DraftRow,
 } from "@/lib/ankiCsvExport";
 import {
+  clearAllByArticleSessionCache,
+  fetchByArticleWithSessionCache,
+} from "@/lib/byArticleSessionCache";
+import {
   eligibleWorkflowRows,
   filterExcluded,
   resolveWorkflowArticleBatch,
@@ -151,6 +155,7 @@ export default function WordsPage() {
         return;
       }
       const st = data.stats;
+      const nextWords = data.words ?? [];
       setSnap((prev) => ({
         ...prev,
         stats: st
@@ -159,8 +164,11 @@ export default function WordsPage() {
               judged: st.judged ?? 0,
             }
           : null,
-        words: data.words ?? [],
+        words: nextWords,
       }));
+      if (nextWords.length > 0) {
+        clearAllByArticleSessionCache();
+      }
     } catch {
       setSnap((s) => ({
         ...s,
@@ -205,23 +213,15 @@ export default function WordsPage() {
         const thaiList = eligible.map((w) => w.thai.trim()).filter(Boolean);
         let articles: ByArticleArticle[] = [];
         if (thaiList.length > 0) {
-          const r = await fetch("/api/by-article", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ words: thaiList }),
-          });
-          const d = (await r.json()) as {
-            articles?: ByArticleArticle[];
-            error?: string;
-          };
-          if (!r.ok) {
+          const res = await fetchByArticleWithSessionCache(thaiList);
+          if (!res.ok) {
             setSnap((s) => ({
               ...s,
-              error: d.error || `选篇失败 (${r.status})`,
+              error: res.error,
             }));
             return;
           }
-          articles = d.articles ?? [];
+          articles = res.articles;
         }
         const resolved = resolveWorkflowArticleBatch({
           catalog: words,
